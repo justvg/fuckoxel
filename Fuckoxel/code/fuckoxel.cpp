@@ -1,6 +1,40 @@
 #include "fuckoxel_math.h"
 #include "fuckoxel_shader.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+static GLuint
+LoadTexture(const char *Path)
+{
+    GLuint TextureID;
+    glGenTextures(1, &TextureID);
+
+    int Width, Height, Channels;
+    stbi_uc *Data = stbi_load(Path, &Width, &Height, &Channels, 0);
+    Assert(Data);
+    if(Data)
+    {
+        GLenum Format;
+        if(Channels == 1) Format = GL_RED;
+        else if(Channels == 3) Format = GL_RGB;
+        else if(Channels == 4) Format = GL_RGBA;
+
+        glBindTexture(GL_TEXTURE_2D, TextureID);
+        glTexImage2D(GL_TEXTURE_2D, 0, Format, Width, Height, 0, Format, GL_UNSIGNED_BYTE, Data);
+        glGenerateMipmap(GL_TEXTURE_2D);
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+
+    stbi_image_free(Data);
+
+    return(TextureID);
+}
+
 struct stack_allocator
 {
     uint64_t Size;
@@ -25,6 +59,17 @@ PushSize(stack_allocator *Allocator, uint64_t Size)
 
     void *Result = Allocator->Base + Allocator->Used;
     Allocator->Used += Size;
+
+    return(Result);
+}
+
+inline stack_allocator
+SubAlloctor(stack_allocator *Allocator, uint64_t Size)
+{
+    stack_allocator Result = {};
+
+    Result.Size = Size;
+    Result.Base = (uint8_t *)PushSize(Allocator, Size);
 
     return(Result);
 }
@@ -172,6 +217,60 @@ PushEntry(dynamic_array_vec4 *Array, vec4 Entry)
     Array->Entries[Array->EntriesCount++] = Entry;
 }
 
+struct dynamic_array_uint32
+{
+    uint32_t MaxEntriesCount;
+    uint32_t EntriesCount;
+    uint32_t *Entries;
+};
+
+static void
+InitializeDynamicArray(dynamic_array_uint32 *Array, uint32_t MaxEntriesCount = 0)
+{
+    Array->MaxEntriesCount = MaxEntriesCount;
+    Array->EntriesCount = 0;
+    Array->Entries = 0;
+}
+
+static void
+ExpandDynamicArray(dynamic_array_uint32 *Array)
+{
+    uint32_t NewMaxEntriesCount = Array->MaxEntriesCount ? 2*Array->MaxEntriesCount : 1;
+    uint32_t *NewMemory = (uint32_t *)malloc(NewMaxEntriesCount*sizeof(uint32_t));
+    Assert(NewMemory);
+
+    for(uint32_t EntryIndex = 0;
+        EntryIndex < Array->EntriesCount;
+        EntryIndex++)
+    {
+        NewMemory[EntryIndex] = Array->Entries[EntryIndex];
+    }
+
+    if(Array->Entries) free(Array->Entries);
+    Array->MaxEntriesCount = NewMaxEntriesCount;
+    Array->Entries = NewMemory;
+}
+
+static void
+FreeDynamicArray(dynamic_array_uint32 *Array)
+{
+    free(Array->Entries);
+    Array->Entries = 0;
+    Array->MaxEntriesCount = 0;
+    Array->EntriesCount = 0;
+}
+
+static void
+PushEntry(dynamic_array_uint32 *Array, uint32_t Entry)
+{
+    if(Array->MaxEntriesCount <= Array->EntriesCount)
+    {
+        ExpandDynamicArray(Array);
+    }
+
+    Array->Entries[Array->EntriesCount++] = Entry;
+}
+
 struct chunk;
 struct light_node
 {
@@ -298,7 +397,8 @@ enum chunk_flag
     CHUNK_LIGHT_PROP_FINISHED = 0x8,
     CHUNK_SETUP = 0x10,
     CHUNK_LOADED = 0x20,
-    CHUNK_RECENTLY_USED = 0x40
+    CHUNK_RECENTLY_USED = 0x40,
+    CHUNK_MODIFIED = 0x80
 };
 struct chunk
 {
@@ -309,7 +409,8 @@ struct chunk
 
     chunk_blocks_info *BlocksInfo;
     dynamic_array_vec4 Vertices;
-    GLuint VAO, VBO;
+    dynamic_array_uint32 Indices;
+    GLuint VAO, VBO, EBO;
 
     sunlight_bfs_queue SunlightBFSQueue;
     sunlight_bfs_queue SunlightBFSQueueFromOtherChunks;
@@ -372,7 +473,65 @@ struct world
     // TODO(georgy): Assert that 2048 is enough! (Make this dynamic array?)
     uint32_t ChunksToRenderCount;
     chunk *ChunksToRender[2048];
+
+    uint64_t Lock;
 };
+
+struct camera
+{
+    vec3 P;
+    vec3 ViewDir;
+
+    float Pitch, Head;
+
+    mat4 GetViewMatrix(void);
+};
+inline mat4
+camera::GetViewMatrix(void)
+{
+    mat4 Result = LookAt(P, P + ViewDir);
+    return(Result);
+}
+
+
+struct hero
+{
+    world_position WorldP;
+
+    vec3 P;
+    vec3 dP;
+    vec3 ddP;
+
+    bool CanJump;
+};
+
+struct game_state
+{
+    bool Gravity;
+    bool IsInitialized;
+
+    camera Camera;
+    hero Hero;
+
+    shader DefaultShader;
+    shader ScreenShader;
+
+    GLuint CrossHairTexture;
+    GLuint QuadVAO, QuadVBO;
+};
+
+struct temp_state
+{
+    bool IsInitialized;
+
+    job_system_queue *JobSystemQueue;
+
+    stack_allocator WorldAllocator;
+    world World;
+
+    stack_allocator TempAllocator;
+};
+
 
 inline void
 ResetWorldWork(world *World)
@@ -421,7 +580,7 @@ GetChunk(world *World, int32_t ChunkX, int32_t ChunkZ, stack_allocator *WorldAll
 
         Chunk->Flags = 0;
         Chunk->BlocksInfo = 0;
-        Chunk->VAO = Chunk->VBO = 0;
+        Chunk->VAO = Chunk->VBO = Chunk->EBO = 0;
 
         Chunk->SunlightBFSQueue.FirstIndex = 0;
         Chunk->SunlightBFSQueueFromOtherChunks.FirstIndex = 0;
@@ -555,168 +714,214 @@ SetBlockColorBetweenChunks(world *World, chunk *Chunk, int32_t X, int32_t Y, int
     BlockColor(Chunk->BlocksInfo->Colors, X, Y, Z) = Color;
 }
 
+inline void
+BeginWorldLock(world *World)
+{
+    for(;;)
+    {
+        if(InterlockedCompareExchange((LONG volatile *)&World->Lock, 1, 0) == 0)
+        {
+            break;
+        }
+    }
+}
+
+inline void
+EndWorldLock(world *World)
+{
+    _WriteBarrier();
+    World->Lock = 0;
+}
+
+struct generate_chunk_job
+{
+    world *World;
+    chunk *Chunk;
+    stack_allocator *WorldAllocator;
+};
 static void
-GenerateChunks(world *World, stack_allocator *WorldAllocator)
+GenerateChunk(void *Data)
+{
+    generate_chunk_job *Job = (generate_chunk_job *)Data;
+    world *World = Job->World;
+    chunk *Chunk = Job->Chunk;
+    stack_allocator *WorldAllocator = Job->WorldAllocator;
+
+    // TODO(georgy): I think float is not enough for all chunks! Check!
+    float BaseX = Chunk->X*World->ChunkDimInMeters.x;
+    float BaseZ = Chunk->Z*World->ChunkDimInMeters.z;
+
+    BeginWorldLock(World);
+    if(!World->FirstFreeChunkBlocksInfo)
+    {
+        World->FirstFreeChunkBlocksInfo = PushStruct(WorldAllocator, chunk_blocks_info);
+    }
+    Chunk->BlocksInfo = World->FirstFreeChunkBlocksInfo;
+    World->FirstFreeChunkBlocksInfo = World->FirstFreeChunkBlocksInfo->NextFree;
+    EndWorldLock(World);
+    ZeroSize(Chunk->BlocksInfo, sizeof(chunk_blocks_info));
+
+    for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
+    {
+        for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
+        {
+            float XPos = BaseX + X * World->BlockDimInMeters;
+            float ZPos = BaseZ + Z * World->BlockDimInMeters;
+
+            float DistortionAmplitude = 30.0f;
+            float DistortionFrequency = 0.5f*0.008333f;
+            float XDistortion = DistortionAmplitude*(2.0f*(1.0f - SimplexNoise2DBetween01(DistortionFrequency*XPos + 235.0f, DistortionFrequency*ZPos + 196.0f)) - 1.0f);
+            float ZDistortion = DistortionAmplitude*(2.0f*(1.0f - SimplexNoise2DBetween01(DistortionFrequency*XPos + 93.0f, DistortionFrequency*ZPos + 321.0f)) - 1.0f);
+            XDistortion = ZDistortion = 0;
+
+            const float StartFrequency = 0.008333f;
+            uint32_t Octaves = 4;
+
+            // NOTE(georgy): Ground
+            float Value0 = 0;
+            float Amplitude = 0.1f;
+            float Frequency = 0.5f*StartFrequency;
+            for (float Octave = 0; Octave < Octaves; Octave++)
+            {
+                float NoiseValue = SimplexNoise2DBetween01(Frequency*(XPos + XDistortion) + 200.0f,
+                                                            Frequency*(ZPos + ZDistortion) + 100.0f);
+                Value0 += Amplitude*NoiseValue;
+
+                Amplitude *= 2.0f;
+                Frequency *= 0.5f;
+            }
+
+            // NOTE(georgy): Hills
+            float Value1 = 0.0f;
+            Amplitude = 0.2f;
+            Frequency = 2.0f*StartFrequency;
+            for (float Octave = 0; Octave < Octaves; Octave++)
+            {
+                float NoiseValue = Absolute(SimplexNoise2D(Frequency*(XPos + XDistortion) + 100.0f,
+                                                            Frequency*(ZPos + ZDistortion) + 300.0f));
+                Value1 += Amplitude*NoiseValue;
+
+                Amplitude *= 2.0f;
+                Frequency *= 0.5;
+            }
+
+            // NOTE(georgy): Add some roughness to the hills
+            Value1 += 0.04f*SimplexNoise2D(((XPos + XDistortion) / 18.0f) + 100.0f, ((ZPos + ZDistortion) / 12.0f) + 300.0f);
+
+            Frequency *= 2.0f;
+
+            // NOTE(georgy): Height variation on hills
+            float Blend = SimplexNoise2D(Frequency*(XPos + XDistortion) + 310.0f, Frequency*(ZPos + ZDistortion) + 470.0f);
+            Blend += 1;
+            Value1 /= 2.0f*(Octaves - 1);
+
+            // Blend the two values
+            Blend = (1.0f - Blend) + 1.0f;
+            Blend *= 0.5f;
+            Blend = Blend*Blend;
+
+            Value1 *= Blend;
+
+            // Scale appropriately
+            float Height = (70.0f*Value0 + 350.0f*Value1);
+            Height = Clamp(Height, 0.0f, 255.0f);
+            Chunk->HeightMap[Z*CHUNK_DIM_X + X] = (uint32_t)roundf(Height);
+
+
+            // NOTE(georgy): River generation part
+            Frequency = 0.5f*StartFrequency;
+            float RiverNoise = SimplexNoise2D(Frequency*XPos + 200.0f,
+                                                Frequency*ZPos + 200.0f);
+            
+            Frequency *= 2.0f;
+            RiverNoise += 0.2f*SimplexNoise2D(Frequency*XPos + 200.0f,
+                                                Frequency*ZPos + 200.0f);
+
+            Frequency *= 2.0f;
+            RiverNoise += 0.02f*SimplexNoise2D(Frequency*XPos + 200.0f,
+                                                Frequency*ZPos + 200.0f);
+
+            float MaxRiverHeight = 120.0f;
+            float MinRiverHeightBorder = 40.0f;
+            float t = Clamp((Height - MinRiverHeightBorder) / (MaxRiverHeight - MinRiverHeightBorder), 0.0f, 1.0f);
+            float RiverWidthBorder = Lerp(0.1f, 0.035f, t);
+
+            if((Height < MaxRiverHeight) && (RiverNoise <= RiverWidthBorder) && (RiverNoise >= -RiverWidthBorder))
+            {
+                float CutHeightNoise = SimplexNoise2DBetween01(2.0f*Frequency*XPos + 478.0f, 2.0f*Frequency*ZPos + 312.0f);
+
+                float MaxCutHeight = 6.0f;
+                float CutHeight = (1.0f - t)*MaxCutHeight*CutHeightNoise;
+                CutHeight = Clamp(CutHeight, 1.0f, 5.0f);
+                Chunk->HeightMap[Z*CHUNK_DIM_X + X] -= (uint32_t)CutHeight;
+
+                for(uint32_t Y = 0; Y <= Chunk->HeightMap[Z*CHUNK_DIM_X + X]; Y++)
+                {
+                    Chunk->BlocksInfo->Blocks[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].Type = block_type::BLOCK_RIVER;
+                    Chunk->BlocksInfo->Colors[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y] = vec3(0.0f, 0.0f, 1.0f);
+                }
+            }
+            else if((Height > MaxRiverHeight) && (Height < (MaxRiverHeight + 5.0f)) && 
+                    (RiverNoise <= 2.0f*RiverWidthBorder) && (RiverNoise >= -2.0f*RiverWidthBorder))
+            {                    
+                Chunk->HeightMap[Z*CHUNK_DIM_X + X] = (uint32_t)MaxRiverHeight;
+
+                for(uint32_t Y = 0; Y <= Chunk->HeightMap[Z*CHUNK_DIM_X + X]; Y++)
+                {
+                    Chunk->BlocksInfo->Blocks[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].Type = block_type::BLOCK_RIVER;
+                    Chunk->BlocksInfo->Colors[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y] = vec3(0.0f, 0.0f, 1.0f);
+                }
+            }
+            else
+            {
+                for(uint32_t Y = 0; Y <= Chunk->HeightMap[Z*CHUNK_DIM_X + X]; Y++)
+                {
+                    float YPos = Y*World->BlockDimInMeters;
+                    Frequency = StartFrequency;
+                    float ColorNoise = SimplexNoise3DBetween01(Frequency*XPos + 135.0f,
+                                                                Frequency*YPos + 235.0f,
+                                                                Frequency*ZPos + 335.0f);
+
+                    vec3 Color = vec3(0.0f, 0.0f, 0.0f);
+                    if(Y == Chunk->HeightMap[Z*CHUNK_DIM_X + X])
+                    {
+                        Color = Lerp(vec3(0.768f, 1.0f, 0.992f), vec3(0.615f, 0.894f, 1.0f), t*ColorNoise*ColorNoise);
+                    }
+                    else
+                    {
+                        Color = Lerp(vec3(0.65f, 0.65f, 0.65f), vec3(0.75f, 0.75f, 0.775f), ColorNoise*ColorNoise);
+                    }
+
+                    Chunk->BlocksInfo->Blocks[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].Type = block_type::BLOCK_SOIL;
+                    Chunk->BlocksInfo->Colors[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y] = Color;
+                }
+            }
+        }
+    }
+
+    _WriteBarrier();
+    SetFlags(Chunk, CHUNK_GENERATED);
+}
+
+static void
+GenerateChunks(temp_state *TempState)
 {
     for(uint32_t ChunkIndex = 0;
-        ChunkIndex < World->ChunksToGenerateCount;
+        ChunkIndex < TempState->World.ChunksToGenerateCount;
         ChunkIndex++)
     {
-		chunk* Chunk = World->ChunksToGenerate[ChunkIndex];
+		chunk* Chunk = TempState->World.ChunksToGenerate[ChunkIndex];
         Assert(!CheckFlag(Chunk, CHUNK_GENERATED));
 
-        // TODO(georgy): I think float is not enough for all chunks! Check!
-        float BaseX = Chunk->X*World->ChunkDimInMeters.x;
-        float BaseZ = Chunk->Z*World->ChunkDimInMeters.z;
+        generate_chunk_job *Job = PushStruct(&TempState->TempAllocator, generate_chunk_job);
+        Job->World = &TempState->World;
+        Job->Chunk = Chunk;
+        Job->WorldAllocator = &TempState->WorldAllocator;
 
-        if(!World->FirstFreeChunkBlocksInfo)
-        {
-            World->FirstFreeChunkBlocksInfo = PushStruct(WorldAllocator, chunk_blocks_info);
-        }
-        Chunk->BlocksInfo = World->FirstFreeChunkBlocksInfo;
-        World->FirstFreeChunkBlocksInfo = World->FirstFreeChunkBlocksInfo->NextFree;
-        ZeroSize(Chunk->BlocksInfo, sizeof(chunk_blocks_info));
-
-        for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
-        {
-            for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
-			{
-				float XPos = BaseX + X * World->BlockDimInMeters;
-				float ZPos = BaseZ + Z * World->BlockDimInMeters;
-
-                float DistortionAmplitude = 30.0f;
-				float DistortionFrequency = 0.5f*0.008333f;
-                float XDistortion = DistortionAmplitude*(2.0f*(1.0f - SimplexNoise2DBetween01(DistortionFrequency*XPos + 235.0f, DistortionFrequency*ZPos + 196.0f)) - 1.0f);
-                float ZDistortion = DistortionAmplitude*(2.0f*(1.0f - SimplexNoise2DBetween01(DistortionFrequency*XPos + 93.0f, DistortionFrequency*ZPos + 321.0f)) - 1.0f);
-                XDistortion = ZDistortion = 0;
-
-                const float StartFrequency = 0.008333f;
-                uint32_t Octaves = 4;
-
-                // NOTE(georgy): Ground
-                float Value0 = 0;
-                float Amplitude = 0.1f;
-                float Frequency = 0.5f*StartFrequency;
-                for (float Octave = 0; Octave < Octaves; Octave++)
-                {
-                    float NoiseValue = SimplexNoise2DBetween01(Frequency*(XPos + XDistortion) + 200.0f,
-                                                               Frequency*(ZPos + ZDistortion) + 100.0f);
-                    Value0 += Amplitude*NoiseValue;
-
-                    Amplitude *= 2.0f;
-                    Frequency *= 0.5f;
-                }
-
-                // NOTE(georgy): Hills
-                float Value1 = 0.0f;
-                Amplitude = 0.2f;
-                Frequency = 2.0f*StartFrequency;
-                for (float Octave = 0; Octave < Octaves; Octave++)
-                {
-                    float NoiseValue = Absolute(SimplexNoise2D(Frequency*(XPos + XDistortion) + 100.0f,
-                                                               Frequency*(ZPos + ZDistortion) + 300.0f));
-                    Value1 += Amplitude*NoiseValue;
-
-                    Amplitude *= 2.0f;
-                    Frequency *= 0.5;
-                }
-
-                // NOTE(georgy): Add some roughness to the hills
-                Value1 += 0.04f*SimplexNoise2D(((XPos + XDistortion) / 18.0f) + 100.0f, ((ZPos + ZDistortion) / 12.0f) + 300.0f);
-
-                Frequency *= 2.0f;
-
-                // NOTE(georgy): Height variation on hills
-                float Blend = SimplexNoise2D(Frequency*(XPos + XDistortion) + 310.0f, Frequency*(ZPos + ZDistortion) + 470.0f);
-                Blend += 1;
-                Value1 /= 2.0f*(Octaves - 1);
-
-                // Blend the two values
-                Blend = (1.0f - Blend) + 1.0f;
-                Blend *= 0.5f;
-                Blend = Blend*Blend;
-
-                Value1 *= Blend;
-
-                // Scale appropriately
-                float Height = (70.0f*Value0 + 350.0f*Value1);
-                Height = Clamp(Height, 0.0f, 255.0f);
-                Chunk->HeightMap[Z*CHUNK_DIM_X + X] = (uint32_t)roundf(Height);
-
-
-                // NOTE(georgy): River generation part
-                Frequency = 0.5f*StartFrequency;
-                float RiverNoise = SimplexNoise2D(Frequency*XPos + 200.0f,
-                                                  Frequency*ZPos + 200.0f);
-                
-                Frequency *= 2.0f;
-                RiverNoise += 0.2f*SimplexNoise2D(Frequency*XPos + 200.0f,
-                                                  Frequency*ZPos + 200.0f);
-
-                Frequency *= 2.0f;
-                RiverNoise += 0.02f*SimplexNoise2D(Frequency*XPos + 200.0f,
-                                                   Frequency*ZPos + 200.0f);
-
-                float MaxRiverHeight = 120.0f;
-                float MinRiverHeightBorder = 40.0f;
-                float t = Clamp((Height - MinRiverHeightBorder) / (MaxRiverHeight - MinRiverHeightBorder), 0.0f, 1.0f);
-                float RiverWidthBorder = Lerp(0.1f, 0.035f, t);
-
-                if((Height < MaxRiverHeight) && (RiverNoise <= RiverWidthBorder) && (RiverNoise >= -RiverWidthBorder))
-                {
-                    float CutHeightNoise = SimplexNoise2DBetween01(2.0f*Frequency*XPos + 478.0f, 2.0f*Frequency*ZPos + 312.0f);
-
-                    float MaxCutHeight = 6.0f;
-                    float CutHeight = (1.0f - t)*MaxCutHeight*CutHeightNoise;
-                    CutHeight = Clamp(CutHeight, 1.0f, 5.0f);
-                    Chunk->HeightMap[Z*CHUNK_DIM_X + X] -= (uint32_t)CutHeight;
-
-                    for(uint32_t Y = 0; Y <= Chunk->HeightMap[Z*CHUNK_DIM_X + X]; Y++)
-                    {
-                        Chunk->BlocksInfo->Blocks[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].Type = block_type::BLOCK_RIVER;
-                        Chunk->BlocksInfo->Colors[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y] = vec3(0.0f, 0.0f, 1.0f);
-                    }
-                }
-                else if((Height > MaxRiverHeight) && (Height < (MaxRiverHeight + 5.0f)) && 
-                        (RiverNoise <= 2.0f*RiverWidthBorder) && (RiverNoise >= -2.0f*RiverWidthBorder))
-                {                    
-                    Chunk->HeightMap[Z*CHUNK_DIM_X + X] = (uint32_t)MaxRiverHeight;
-
-                    for(uint32_t Y = 0; Y <= Chunk->HeightMap[Z*CHUNK_DIM_X + X]; Y++)
-                    {
-                        Chunk->BlocksInfo->Blocks[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].Type = block_type::BLOCK_RIVER;
-                        Chunk->BlocksInfo->Colors[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y] = vec3(0.0f, 0.0f, 1.0f);
-                    }
-                }
-                else
-                {
-                    for(uint32_t Y = 0; Y <= Chunk->HeightMap[Z*CHUNK_DIM_X + X]; Y++)
-                    {
-                        float YPos = Y*World->BlockDimInMeters;
-                        Frequency = StartFrequency;
-                        float ColorNoise = SimplexNoise3DBetween01(Frequency*XPos + 135.0f,
-                                                                   Frequency*YPos + 235.0f,
-                                                                   Frequency*ZPos + 335.0f);
-
-                        vec3 Color = vec3(0.0f, 0.0f, 0.0f);
-                        if(Y == Chunk->HeightMap[Z*CHUNK_DIM_X + X])
-                        {
-                            Color = Lerp(vec3(0.768f, 1.0f, 0.992f), vec3(0.615f, 0.894f, 1.0f), t*ColorNoise*ColorNoise);
-                        }
-                        else
-                        {
-                            Color = Lerp(vec3(0.65f, 0.65f, 0.65f), vec3(0.75f, 0.75f, 0.775f), ColorNoise*ColorNoise);
-                        }
-
-                        Chunk->BlocksInfo->Blocks[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].Type = block_type::BLOCK_SOIL;
-                        Chunk->BlocksInfo->Colors[Y + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y] = Color;
-                    }
-                }
-			}
-        }
-
-        SetFlags(Chunk, CHUNK_GENERATED);
+        JobSystemAddEntry(TempState->JobSystemQueue, GenerateChunk, Job);
     }
+
+    JobSystemCompleteAllWork(TempState->JobSystemQueue);
 }
 
 static bool
@@ -777,107 +982,129 @@ AddLeaves(world *World, chunk *Chunk, int32_t BaseX, int32_t BaseY, int32_t Base
     }
 }
 
-static void
-PlaceTreesChunks(world *World)
+struct place_trees_job
 {
-    for(uint32_t ChunkIndex = 0;
-        ChunkIndex < World->ChunksToPlaceTreesCount;
-        ChunkIndex++)
+    world *World;
+    chunk *Chunk;
+};
+static void
+PlaceTreesChunk(void *Data)
+{
+    place_trees_job *Job = (place_trees_job *)Data;
+    world *World = Job->World;
+    chunk *Chunk = Job->Chunk;
+
+    // TODO(georgy): I think float is not enough for all chunks! Check!
+    float BaseX = Chunk->X*World->ChunkDimInMeters.x;
+    float BaseZ = Chunk->Z*World->ChunkDimInMeters.z;
+
+    uint32_t TriesToPlaceTree = 0;
+    while(TriesToPlaceTree < 5)
     {
-        chunk *Chunk = World->ChunksToPlaceTrees[ChunkIndex];
-        Assert(!CheckFlag(Chunk, CHUNK_TREES_PLACED));
+        float Frequency = 10.0f*0.008333f;
+        float NoiseX = SimplexNoise2DBetween01(Frequency*BaseX + (TriesToPlaceTree+1)*120.23f, Frequency*BaseZ + (TriesToPlaceTree+1)*100.56f);
+        float NoiseZ = SimplexNoise2DBetween01(Frequency*BaseX + (TriesToPlaceTree+1)*931.67f, Frequency*BaseZ + (TriesToPlaceTree+1)*456.12f);
 
-        // TODO(georgy): I think float is not enough for all chunks! Check!
-        float BaseX = Chunk->X*World->ChunkDimInMeters.x;
-        float BaseZ = Chunk->Z*World->ChunkDimInMeters.z;
-
-        uint32_t TriesToPlaceTree = 0;
-        while(TriesToPlaceTree < 5)
+        uint32_t TreeX = FloorReal32ToInt32(NoiseX*CHUNK_DIM_X);
+        uint32_t TreeZ = FloorReal32ToInt32(NoiseZ*CHUNK_DIM_Z);
+        uint32_t Height = Chunk->HeightMap[TreeZ*CHUNK_DIM_X + TreeX];
+        bool Placeable = CanPlaceTree(World, Chunk, (float)Height, TreeX, TreeZ);
+        if(Placeable && (Height < 80))
         {
-            float Frequency = 10.0f*0.008333f;
-            float NoiseX = SimplexNoise2DBetween01(Frequency*BaseX + (TriesToPlaceTree+1)*120.23f, Frequency*BaseZ + (TriesToPlaceTree+1)*100.56f);
-            float NoiseZ = SimplexNoise2DBetween01(Frequency*BaseX + (TriesToPlaceTree+1)*931.67f, Frequency*BaseZ + (TriesToPlaceTree+1)*456.12f);
-
-            uint32_t TreeX = FloorReal32ToInt32(NoiseX*CHUNK_DIM_X);
-            uint32_t TreeZ = FloorReal32ToInt32(NoiseZ*CHUNK_DIM_Z);
-            uint32_t Height = Chunk->HeightMap[TreeZ*CHUNK_DIM_X + TreeX];
-            bool Placeable = CanPlaceTree(World, Chunk, (float)Height, TreeX, TreeZ);
-            if(Placeable && (Height < 80))
+            if(BlockType(Chunk->BlocksInfo->Blocks, TreeX, Height, TreeZ) != block_type::BLOCK_RIVER)
             {
-                if(BlockType(Chunk->BlocksInfo->Blocks, TreeX, Height, TreeZ) != block_type::BLOCK_RIVER)
+                Frequency *= 2.0f;
+                float TrunkNoise = SimplexNoise2DBetween01(Frequency*BaseX + 555.44f, Frequency*BaseZ + 676.23f);
+
+                int32_t TrunkHeight = 6 + (int32_t)roundf(6*TrunkNoise);
+                for(int32_t TrunkY = 0; TrunkY < TrunkHeight; TrunkY++)
                 {
-                    Frequency *= 2.0f;
-                    float TrunkNoise = SimplexNoise2DBetween01(Frequency*BaseX + 555.44f, Frequency*BaseZ + 676.23f);
+                    uint32_t Y = Height + (TrunkY + 1);
+                    int32_t Width = Max(3, 5 - TrunkY);
 
-                    int32_t TrunkHeight = 6 + (int32_t)roundf(6*TrunkNoise);
-                    for(int32_t TrunkY = 0; TrunkY < TrunkHeight; TrunkY++)
+                    for(int32_t LocalX = -Width; LocalX < Width; LocalX++)
                     {
-                        uint32_t Y = Height + (TrunkY + 1);
-                        int32_t Width = Max(3, 5 - TrunkY);
-
-                        for(int32_t LocalX = -Width; LocalX < Width; LocalX++)
+                        for(int32_t LocalZ = -Width; LocalZ < Width; LocalZ++)
                         {
-                            for(int32_t LocalZ = -Width; LocalZ < Width; LocalZ++)
-                            {
-                                if(((LocalX >= 1) || (LocalX < -1)) && ((LocalZ >= 1) || (LocalZ < -1))) continue;
+                            if(((LocalX >= 1) || (LocalX < -1)) && ((LocalZ >= 1) || (LocalZ < -1))) continue;
 
-                                int32_t X = TreeX + LocalX;
-                                int32_t Z = TreeZ + LocalZ;
-                                SetBlockTypeBetweenChunks(World, Chunk, X, Y, Z, block_type::BLOCK_WOOD);
-                                SetBlockColorBetweenChunks(World, Chunk, X, Y, Z, vec3(0.46666f, 0.2666f, 0.0f));
-                            } 
-                        }
-                    }
-
-                    Frequency *= 0.4f;
-                    float RadiusYNoise = Square(SimplexNoise2DBetween01(Frequency*BaseX + 735.45f, Frequency*BaseZ + 12.23f));
-                    float RadiusXNoise = Square(SimplexNoise2DBetween01(Frequency*BaseX + 673.78f, Frequency*BaseZ + 856.13f));
-                    float RadiusZNoise = Square(SimplexNoise2DBetween01(Frequency*BaseX + 57.43f, Frequency*BaseZ + 219.68f));
-                    int32_t RadiusY = 5 + (int32_t)(roundf(4*RadiusYNoise));
-                    int32_t RadiusX = RadiusY + 2 + (int32_t)(roundf(4*RadiusXNoise));
-                    int32_t RadiusZ = RadiusY + 2 + (int32_t)(roundf(4*RadiusZNoise));
-
-					Frequency = 12.0f * 0.008333f;
-					vec3 Colors[] = { vec3(0.0f, 0.53333f, 0.0f),
-									  vec3(1.0f, 0.46666f, 0.0f),
-									  vec3(0.8f, 1.0f, 0.0f),
-									  vec3(0.3333f, 0.6f, 0.0f) };
-					float LeaveColorNoise = SimplexNoise2DBetween01(Frequency * BaseX + 777.23f, Frequency * BaseZ + 666.56f);
-					uint32_t ColorIndex = (int32_t)roundf(LeaveColorNoise * (ArrayCount(Colors) - 1));
-					AddLeaves(World, Chunk, TreeX, Height + TrunkHeight + 1, TreeZ, RadiusX, RadiusY, RadiusZ, RadiusY, Colors[ColorIndex]);
-
-                    Frequency *= 1.15f;
-                    float StepNoise = SimplexNoise2DBetween01(Frequency*BaseX + 749.11f, Frequency*BaseZ + 497.22f);
-                    int32_t Steps = 5 + (int32_t)(roundf(3*StepNoise));
-
-                    float Angle = 0.0f;
-                    for(int32_t Step = 0; Step < Steps; Step++)
-                    {
-                        float RadiusYNoise = SimplexNoise2DBetween01(Frequency*BaseX + Step*312.43f, Frequency*BaseZ + Step*78.45f);
-                        float RadiusXNoise = SimplexNoise2DBetween01(Frequency*BaseX + Step*941.64f, Frequency*BaseZ + Step*56.234f);
-                        float RadiusZNoise = SimplexNoise2DBetween01(Frequency*BaseX + Step*195.47f, Frequency*BaseZ + Step*191.123f);
-                        int32_t NewRadiusY = RadiusY - (1 + (int32_t)roundf(2*RadiusYNoise));
-                        int32_t NewRadiusX = RadiusX - (1 + (int32_t)roundf(4*RadiusXNoise));
-                        int32_t NewRadiusZ = RadiusZ - (1 + (int32_t)roundf(4*RadiusZNoise));
-
-                        float OffsetYNoise = SimplexNoise2DBetween01(Frequency*BaseX + 111.46f, Frequency*BaseZ + 222.12f);
-                        vec3 Offset = vec3(7*Sin(Angle), roundf(5*OffsetYNoise) - 2, 7*Cos(Angle));
-
-					    AddLeaves(World, Chunk, TreeX + (int32_t)roundf(Offset.x), Height + TrunkHeight + 1 + (int32_t)roundf(Offset.y), TreeZ + (int32_t)roundf(Offset.z), 
-                                  NewRadiusX, NewRadiusY, NewRadiusZ, RadiusY, Colors[ColorIndex]);
-
-                        Angle += 2*PI / Steps;
+                            int32_t X = TreeX + LocalX;
+                            int32_t Z = TreeZ + LocalZ;
+                            SetBlockTypeBetweenChunks(World, Chunk, X, Y, Z, block_type::BLOCK_WOOD);
+                            SetBlockColorBetweenChunks(World, Chunk, X, Y, Z, vec3(0.46666f, 0.2666f, 0.0f));
+                        } 
                     }
                 }
 
-                break;
+                Frequency *= 0.4f;
+                float RadiusYNoise = Square(SimplexNoise2DBetween01(Frequency*BaseX + 735.45f, Frequency*BaseZ + 12.23f));
+                float RadiusXNoise = Square(SimplexNoise2DBetween01(Frequency*BaseX + 673.78f, Frequency*BaseZ + 856.13f));
+                float RadiusZNoise = Square(SimplexNoise2DBetween01(Frequency*BaseX + 57.43f, Frequency*BaseZ + 219.68f));
+                int32_t RadiusY = 5 + (int32_t)(roundf(4*RadiusYNoise));
+                int32_t RadiusX = RadiusY + 2 + (int32_t)(roundf(4*RadiusXNoise));
+                int32_t RadiusZ = RadiusY + 2 + (int32_t)(roundf(4*RadiusZNoise));
+
+                Frequency = 12.0f * 0.008333f;
+                vec3 Colors[] = { vec3(0.0f, 0.53333f, 0.0f),
+                                vec3(1.0f, 0.46666f, 0.0f),
+                                vec3(0.8f, 1.0f, 0.0f),
+                                vec3(0.3333f, 0.6f, 0.0f) };
+                float LeaveColorNoise = SimplexNoise2DBetween01(Frequency * BaseX + 777.23f, Frequency * BaseZ + 666.56f);
+                uint32_t ColorIndex = (int32_t)roundf(LeaveColorNoise * (ArrayCount(Colors) - 1));
+                AddLeaves(World, Chunk, TreeX, Height + TrunkHeight + 1, TreeZ, RadiusX, RadiusY, RadiusZ, RadiusY, Colors[ColorIndex]);
+
+                Frequency *= 1.15f;
+                float StepNoise = SimplexNoise2DBetween01(Frequency*BaseX + 749.11f, Frequency*BaseZ + 497.22f);
+                int32_t Steps = 5 + (int32_t)(roundf(3*StepNoise));
+
+                float Angle = 0.0f;
+                for(int32_t Step = 0; Step < Steps; Step++)
+                {
+                    float RadiusYNoise = SimplexNoise2DBetween01(Frequency*BaseX + Step*312.43f, Frequency*BaseZ + Step*78.45f);
+                    float RadiusXNoise = SimplexNoise2DBetween01(Frequency*BaseX + Step*941.64f, Frequency*BaseZ + Step*56.234f);
+                    float RadiusZNoise = SimplexNoise2DBetween01(Frequency*BaseX + Step*195.47f, Frequency*BaseZ + Step*191.123f);
+                    int32_t NewRadiusY = RadiusY - (1 + (int32_t)roundf(2*RadiusYNoise));
+                    int32_t NewRadiusX = RadiusX - (1 + (int32_t)roundf(4*RadiusXNoise));
+                    int32_t NewRadiusZ = RadiusZ - (1 + (int32_t)roundf(4*RadiusZNoise));
+
+                    float OffsetYNoise = SimplexNoise2DBetween01(Frequency*BaseX + 111.46f, Frequency*BaseZ + 222.12f);
+                    vec3 Offset = vec3(7*Sin(Angle), roundf(5*OffsetYNoise) - 2, 7*Cos(Angle));
+
+                    AddLeaves(World, Chunk, TreeX + (int32_t)roundf(Offset.x), Height + TrunkHeight + 1 + (int32_t)roundf(Offset.y), TreeZ + (int32_t)roundf(Offset.z), 
+                            NewRadiusX, NewRadiusY, NewRadiusZ, RadiusY, Colors[ColorIndex]);
+
+                    Angle += 2*PI / Steps;
+                }
             }
 
-            ++TriesToPlaceTree;
+            break;
         }
 
-        SetFlags(Chunk, CHUNK_TREES_PLACED);
+        ++TriesToPlaceTree;
     }
+
+    _WriteBarrier();
+    SetFlags(Chunk, CHUNK_TREES_PLACED);
+}
+
+static void
+PlaceTreesChunks(temp_state *TempState)
+{
+    for(uint32_t ChunkIndex = 0;
+        ChunkIndex < TempState->World.ChunksToPlaceTreesCount;
+        ChunkIndex++)
+    {
+        chunk *Chunk = TempState->World.ChunksToPlaceTrees[ChunkIndex];
+        Assert(!CheckFlag(Chunk, CHUNK_TREES_PLACED));
+
+        place_trees_job *Job = PushStruct(&TempState->TempAllocator, place_trees_job);
+        Job->World = &TempState->World;
+        Job->Chunk = Chunk;
+
+        JobSystemAddEntry(TempState->JobSystemQueue, PlaceTreesChunk, Job);
+    }
+
+    JobSystemCompleteAllWork(TempState->JobSystemQueue);
 }
 
 static void
@@ -896,63 +1123,179 @@ PropagateLightFromBlock(world *World, chunk *Chunk, light_node &LightNode, int32
     }
     else
     {
+        BeginWorldLock(World);
         Enqueue(&ChunkToPropagate->SunlightBFSQueueFromOtherChunks, NewLightNode);
+        EndWorldLock(World);
     }
 }
 
-static void
-PropagateLightChunks(world *World)
+struct propagate_light_chunk_job
 {
-    for(uint32_t ChunkIndex = 0;
-        ChunkIndex < World->ChunksToPropagateLightCount;
-        ChunkIndex++)
+    world *World;
+    chunk *Chunk;
+};
+static void
+PropagateLightChunk(void *Data)
+{
+    propagate_light_chunk_job *Job = (propagate_light_chunk_job *)Data;
+    world *World = Job->World;
+    chunk *Chunk = Job->Chunk;
+
+    for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
     {
-        chunk *Chunk = World->ChunksToPropagateLight[ChunkIndex];
-        Assert(!CheckFlag(Chunk, CHUNK_LIGHT_PROP_STARTED));
-
-        for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
+        for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
         {
-            for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
+            if(!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, CHUNK_DIM_Y - 1, Z))
             {
-                if(!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, CHUNK_DIM_Y - 1, Z))
-                {
-                    Chunk->BlocksInfo->Blocks[(CHUNK_DIM_Y - 1) + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].LightLevel = 15;
+                Chunk->BlocksInfo->Blocks[(CHUNK_DIM_Y - 1) + X*CHUNK_DIM_Y + Z*CHUNK_DIM_X*CHUNK_DIM_Y].LightLevel = 15;
 
-                    light_node LightNode(15, X, CHUNK_DIM_Y - 1, Z, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueue, LightNode);
-                }
+                light_node LightNode(15, X, CHUNK_DIM_Y - 1, Z, Chunk);
+                Enqueue(&Chunk->SunlightBFSQueue, LightNode);
             }
         }
+    }
 
-        while(Chunk->SunlightBFSQueue.FirstIndex != Chunk->SunlightBFSQueue.LightNodes.EntriesCount)
+    while(Chunk->SunlightBFSQueue.FirstIndex != Chunk->SunlightBFSQueue.LightNodes.EntriesCount)
+    {
+        light_node LightNode = Dequeue(&Chunk->SunlightBFSQueue);
+        uint32_t X = LightNode.X;
+        uint32_t Y = LightNode.Y;
+        uint32_t Z = LightNode.Z;
+
+        if((!IsBlockSolidBetweenChunks(World, Chunk, X - 1, Y, Z)) &&
+            ((GetLightLevelBetweenChunks(World, Chunk, X - 1, Y, Z) + 2) <= LightNode.LightLevel))
         {
-            light_node LightNode = Dequeue(&Chunk->SunlightBFSQueue);
-            uint32_t X = LightNode.X;
-            uint32_t Y = LightNode.Y;
-            uint32_t Z = LightNode.Z;
+            PropagateLightFromBlock(World, Chunk, LightNode, X - 1, Y, Z);
+        }
 
-            if((!IsBlockSolidBetweenChunks(World, Chunk, X - 1, Y, Z)) &&
-                ((GetLightLevelBetweenChunks(World, Chunk, X - 1, Y, Z) + 2) <= LightNode.LightLevel))
+        if((!IsBlockSolidBetweenChunks(World, Chunk, X + 1, Y, Z)) &&
+            ((GetLightLevelBetweenChunks(World, Chunk, X + 1, Y, Z) + 2) <= LightNode.LightLevel))
+        {
+            PropagateLightFromBlock(World, Chunk, LightNode, X + 1, Y, Z);
+        }
+
+        if((!IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z - 1)) &&
+            ((GetLightLevelBetweenChunks(World, Chunk, X, Y, Z - 1) + 2) <= LightNode.LightLevel))
+        {
+            PropagateLightFromBlock(World, Chunk, LightNode, X, Y, Z - 1);
+        }
+
+        if((!IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z + 1)) &&
+            ((GetLightLevelBetweenChunks(World, Chunk, X, Y, Z + 1) + 2) <= LightNode.LightLevel))
+        {
+            PropagateLightFromBlock(World, Chunk, LightNode, X, Y, Z + 1);
+        }
+
+        if((Y != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y - 1, Z)) &&
+            ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y-1, Z) + 2) <= LightNode.LightLevel))
+        {
+            int8_t NewLightLevel = 15;
+            if(LightNode.LightLevel < 15)
             {
-                PropagateLightFromBlock(World, Chunk, LightNode, X - 1, Y, Z);
+                NewLightLevel = ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
             }
 
-            if((!IsBlockSolidBetweenChunks(World, Chunk, X + 1, Y, Z)) &&
-                ((GetLightLevelBetweenChunks(World, Chunk, X + 1, Y, Z) + 2) <= LightNode.LightLevel))
+            BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y-1, Z) = NewLightLevel;
+
+            light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y - 1, Z), X, Y - 1, Z, Chunk);
+            Enqueue(&Chunk->SunlightBFSQueue, NewLightNode);
+        }
+
+        if((Y != (CHUNK_DIM_Y - 1)) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y + 1, Z)) &&
+            ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y+1, Z) + 2) <= LightNode.LightLevel))
+        {
+            BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y+1, Z) = 
+                                    ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
+
+            light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y + 1, Z), X, Y + 1, Z, Chunk);
+            Enqueue(&Chunk->SunlightBFSQueue, NewLightNode);
+        }
+    }
+
+    _WriteBarrier();
+    SetFlags(Chunk, CHUNK_LIGHT_PROP_STARTED);
+}
+
+static void
+PropagateLightChunks(temp_state *TempState)
+{
+    for(uint32_t ChunkIndex = 0;
+        ChunkIndex < TempState->World.ChunksToPropagateLightCount;
+        ChunkIndex++)
+    {
+        chunk *Chunk = TempState->World.ChunksToPropagateLight[ChunkIndex];
+        Assert(!CheckFlag(Chunk, CHUNK_LIGHT_PROP_STARTED));
+
+        propagate_light_chunk_job *Job = PushStruct(&TempState->TempAllocator, propagate_light_chunk_job);
+        Job->World = &TempState->World;
+        Job->Chunk = Chunk;
+
+        JobSystemAddEntry(TempState->JobSystemQueue, PropagateLightChunk, Job);        
+    }
+
+    JobSystemCompleteAllWork(TempState->JobSystemQueue);
+}
+
+struct finish_propagate_light_chunk
+{
+    chunk *Chunk;
+};
+static void
+FinishPropagateLightChunk(void *Data)
+{
+    finish_propagate_light_chunk *Job = (finish_propagate_light_chunk *)Data;
+    chunk *Chunk = Job->Chunk;
+
+    while(Chunk->SunlightBFSQueueFromOtherChunks.FirstIndex != Chunk->SunlightBFSQueueFromOtherChunks.LightNodes.EntriesCount)
+    {
+        light_node LightNode = Dequeue(&Chunk->SunlightBFSQueueFromOtherChunks);
+        uint32_t X = LightNode.X;
+        uint32_t Y = LightNode.Y;
+        uint32_t Z = LightNode.Z;
+
+        if((LightNode.LightLevel >= BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z)) &&
+            !IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z))
+        {
+            BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z) = LightNode.LightLevel;
+
+            if((X != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X - 1, Y, Z)) &&
+                ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X - 1, Y, Z) + 2) <= LightNode.LightLevel))
             {
-                PropagateLightFromBlock(World, Chunk, LightNode, X + 1, Y, Z);
+                BlockLightLevel(Chunk->BlocksInfo->Blocks, X-1, Y, Z) = 
+                                    ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
+
+                light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X-1, Y, Z), X - 1, Y, Z, Chunk);
+                Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
             }
 
-            if((!IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z - 1)) &&
-                ((GetLightLevelBetweenChunks(World, Chunk, X, Y, Z - 1) + 2) <= LightNode.LightLevel))
+            if((X != (CHUNK_DIM_X - 1)) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X + 1, Y, Z)) &&
+                ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X + 1, Y, Z) + 2) <= LightNode.LightLevel))
             {
-                PropagateLightFromBlock(World, Chunk, LightNode, X, Y, Z - 1);
+                BlockLightLevel(Chunk->BlocksInfo->Blocks, X+1, Y, Z) = 
+                                    ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
+
+                light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X+1, Y, Z), X + 1, Y, Z, Chunk);
+                Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
             }
 
-            if((!IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z + 1)) &&
-                ((GetLightLevelBetweenChunks(World, Chunk, X, Y, Z + 1) + 2) <= LightNode.LightLevel))
+            if((Z != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z - 1)) &&
+                ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z - 1) + 2) <= LightNode.LightLevel))
             {
-                PropagateLightFromBlock(World, Chunk, LightNode, X, Y, Z + 1);
+                BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z - 1) = 
+                                    ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
+
+                light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z-1), X, Y, Z - 1, Chunk);
+                Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
+            }
+
+            if((Z != (CHUNK_DIM_Z - 1)) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z + 1)) &&
+                ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z + 1) + 2) <= LightNode.LightLevel))
+            {
+                BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z + 1) = 
+                                    ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
+
+                light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z+1), X, Y, Z + 1, Chunk);
+                Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
             }
 
             if((Y != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y - 1, Z)) &&
@@ -980,102 +1323,29 @@ PropagateLightChunks(world *World)
                 Enqueue(&Chunk->SunlightBFSQueue, NewLightNode);
             }
         }
-
-        SetFlags(Chunk, CHUNK_LIGHT_PROP_STARTED);
     }
+
+    _WriteBarrier();
+    SetFlags(Chunk, CHUNK_LIGHT_PROP_FINISHED);
 }
 
 static void
-FinishPropagateLightChunks(world* World)
+FinishPropagateLightChunks(temp_state *TempState)
 {
     for(uint32_t ChunkIndex = 0;
-        ChunkIndex < World->ChunksToFinishPropagateLightCount;
+        ChunkIndex < TempState->World.ChunksToFinishPropagateLightCount;
         ChunkIndex++)
     {
-        chunk *Chunk = World->ChunksToFinishPropagateLight[ChunkIndex];
+        chunk *Chunk = TempState->World.ChunksToFinishPropagateLight[ChunkIndex];
         Assert(!CheckFlag(Chunk, CHUNK_LIGHT_PROP_FINISHED));
 
-        while(Chunk->SunlightBFSQueueFromOtherChunks.FirstIndex != Chunk->SunlightBFSQueueFromOtherChunks.LightNodes.EntriesCount)
-        {
-            light_node LightNode = Dequeue(&Chunk->SunlightBFSQueueFromOtherChunks);
-            uint32_t X = LightNode.X;
-            uint32_t Y = LightNode.Y;
-            uint32_t Z = LightNode.Z;
+        finish_propagate_light_chunk *Job = PushStruct(&TempState->TempAllocator, finish_propagate_light_chunk);
+        Job->Chunk = Chunk;
 
-            if((LightNode.LightLevel >= BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z)) &&
-               !IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z))
-            {
-                BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z) = LightNode.LightLevel;
-
-                if((X != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X - 1, Y, Z)) &&
-                   ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X - 1, Y, Z) + 2) <= LightNode.LightLevel))
-                {
-                    BlockLightLevel(Chunk->BlocksInfo->Blocks, X-1, Y, Z) = 
-                                        ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
-
-                    light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X-1, Y, Z), X - 1, Y, Z, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
-                }
-
-                if((X != (CHUNK_DIM_X - 1)) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X + 1, Y, Z)) &&
-                   ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X + 1, Y, Z) + 2) <= LightNode.LightLevel))
-                {
-                    BlockLightLevel(Chunk->BlocksInfo->Blocks, X+1, Y, Z) = 
-                                        ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
-
-                    light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X+1, Y, Z), X + 1, Y, Z, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
-                }
-
-                if((Z != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z - 1)) &&
-                   ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z - 1) + 2) <= LightNode.LightLevel))
-                {
-                    BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z - 1) = 
-                                        ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
-
-                    light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z-1), X, Y, Z - 1, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
-                }
-
-                if((Z != (CHUNK_DIM_Z - 1)) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z + 1)) &&
-                   ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z + 1) + 2) <= LightNode.LightLevel))
-                {
-                    BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z + 1) = 
-                                        ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
-
-                    light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y, Z+1), X, Y, Z + 1, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueueFromOtherChunks, NewLightNode);
-                }
-
-                if((Y != 0) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y - 1, Z)) &&
-                   ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y-1, Z) + 2) <= LightNode.LightLevel))
-                {
-                    int8_t NewLightLevel = 15;
-                    if(LightNode.LightLevel < 15)
-                    {
-                        NewLightLevel = ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
-                    }
-
-                    BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y-1, Z) = NewLightLevel;
-
-                    light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y - 1, Z), X, Y - 1, Z, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueue, NewLightNode);
-                }
-
-                if((Y != (CHUNK_DIM_Y - 1)) && (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y + 1, Z)) &&
-                    ((BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y+1, Z) + 2) <= LightNode.LightLevel))
-                {
-                    BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y+1, Z) = 
-                                            ((LightNode.LightLevel - 1) >= 0) ? LightNode.LightLevel - 1 : 0;
-
-                    light_node NewLightNode(BlockLightLevel(Chunk->BlocksInfo->Blocks, X, Y + 1, Z), X, Y + 1, Z, Chunk);
-                    Enqueue(&Chunk->SunlightBFSQueue, NewLightNode);
-                }
-            }
-        }
-
-		SetFlags(Chunk, CHUNK_LIGHT_PROP_FINISHED);
+        JobSystemAddEntry(TempState->JobSystemQueue, FinishPropagateLightChunk, Job);      
     }
+
+    JobSystemCompleteAllWork(TempState->JobSystemQueue);
 }
 
 inline float
@@ -1099,13 +1369,12 @@ static void
 PushVoxelFaceVertices(chunk *Chunk, vec4 &A, vec4 &B, vec4 &C, vec4 &D, 
                       vec4 &AColor, vec4 &BColor, vec4 &CColor, vec4 &DColor, bool Order)
 {
+    uint32_t VerticesCountBeforeQuad = Chunk->Vertices.EntriesCount / 2;
     if(Order)
     {
         PushEntry(&Chunk->Vertices, A); PushEntry(&Chunk->Vertices, AColor);
         PushEntry(&Chunk->Vertices, B); PushEntry(&Chunk->Vertices, BColor);
         PushEntry(&Chunk->Vertices, C); PushEntry(&Chunk->Vertices, CColor);
-        PushEntry(&Chunk->Vertices, C); PushEntry(&Chunk->Vertices, CColor);
-        PushEntry(&Chunk->Vertices, B); PushEntry(&Chunk->Vertices, BColor);
         PushEntry(&Chunk->Vertices, D); PushEntry(&Chunk->Vertices, DColor);
     }
     else
@@ -1113,488 +1382,522 @@ PushVoxelFaceVertices(chunk *Chunk, vec4 &A, vec4 &B, vec4 &C, vec4 &D,
         PushEntry(&Chunk->Vertices, B); PushEntry(&Chunk->Vertices, BColor);
         PushEntry(&Chunk->Vertices, D); PushEntry(&Chunk->Vertices, DColor);
         PushEntry(&Chunk->Vertices, A); PushEntry(&Chunk->Vertices, AColor);
-        PushEntry(&Chunk->Vertices, A); PushEntry(&Chunk->Vertices, AColor);
-        PushEntry(&Chunk->Vertices, D); PushEntry(&Chunk->Vertices, DColor);
         PushEntry(&Chunk->Vertices, C); PushEntry(&Chunk->Vertices, CColor);
     }
+    
+    PushEntry(&Chunk->Indices, VerticesCountBeforeQuad);
+    PushEntry(&Chunk->Indices, VerticesCountBeforeQuad + 1);
+    PushEntry(&Chunk->Indices, VerticesCountBeforeQuad + 2);
+    PushEntry(&Chunk->Indices, VerticesCountBeforeQuad + 2);
+    PushEntry(&Chunk->Indices, VerticesCountBeforeQuad + 1);
+    PushEntry(&Chunk->Indices, VerticesCountBeforeQuad + 3);
 }
 
 static void
-SetupChunks(world *World)
+GenerateChunkVertices(world *World, chunk *Chunk)
 {
-    for(uint32_t ChunkIndex = 0;
-        ChunkIndex < World->ChunksToSetupCount;
-        ChunkIndex++)
+    for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
     {
-        chunk *Chunk = World->ChunksToSetup[ChunkIndex];
-        Assert(!CheckFlag(Chunk, CHUNK_SETUP));
-
-        InitializeDynamicArray(&Chunk->Vertices); 
-        for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
+        for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
         {
-            for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
+            for(uint32_t Y = 0; Y < CHUNK_DIM_Y; Y++)
             {
-                for(uint32_t Y = 0; Y < CHUNK_DIM_Y; Y++)
+                if(IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z))
                 {
-                    if(IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z))
+                    float BlockDimInMeters = World->BlockDimInMeters;
+                    float XPos = X*BlockDimInMeters;
+                    float YPos = Y*BlockDimInMeters;
+                    float ZPos = Z*BlockDimInMeters;
+
+                    vec3 Color = BlockColor(Chunk->BlocksInfo->Colors, X, Y, Z);
+
+                    if((X == 0) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X - 1, Y, Z)))
                     {
-                        float BlockDimInMeters = World->BlockDimInMeters;
-                        float XPos = X*BlockDimInMeters;
-                        float YPos = Y*BlockDimInMeters;
-                        float ZPos = Z*BlockDimInMeters;
+                        int8_t Side0, Side1, Corner;
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1);
+                        float AAO = VertexAO(Side0, Side1, Corner);
+                        vec4 A = vec4(XPos, YPos, ZPos, AAO);
 
-                        vec3 Color = BlockColor(Chunk->BlocksInfo->Colors, X, Y, Z);
+                        uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1);
+                        int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z);
+                        float ALightIntensity = ALightLevel / (ACount*15.0f);
+                        vec4 AColor = vec4(Color, ALightIntensity);
 
-                        if((X == 0) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X - 1, Y, Z)))
-                        {
-                            int8_t Side0, Side1, Corner;
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1);
-                            float AAO = VertexAO(Side0, Side1, Corner);
-                            vec4 A = vec4(XPos, YPos, ZPos, AAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1);
+                        float BAO = VertexAO(Side0, Side1, Corner);
+                        vec4 B = vec4(XPos, YPos, ZPos + BlockDimInMeters, BAO);
 
-                            uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1);
-                            int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z);
-                            float ALightIntensity = ALightLevel / (ACount*15.0f);
-                            vec4 AColor = vec4(Color, ALightIntensity);
+                        uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1);
+                        int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1);
+                        float BLightIntensity = BLightLevel / (BCount*15.0f);
+                        vec4 BColor = vec4(Color, BLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1);
-                            float BAO = VertexAO(Side0, Side1, Corner);
-                            vec4 B = vec4(XPos, YPos, ZPos + BlockDimInMeters, BAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1);
+                        float CAO = VertexAO(Side0, Side1, Corner);
+                        vec4 C = vec4(XPos, YPos + BlockDimInMeters, ZPos, CAO);
 
-                            uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1);
-                            int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1);
-                            float BLightIntensity = BLightLevel / (BCount*15.0f);
-                            vec4 BColor = vec4(Color, BLightIntensity);
+                        uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1);
+                        int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z);
+                        float CLightIntensity = CLightLevel / (CCount*15.0f);
+                        vec4 CColor = vec4(Color, CLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1);
-                            float CAO = VertexAO(Side0, Side1, Corner);
-                            vec4 C = vec4(XPos, YPos + BlockDimInMeters, ZPos, CAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
+                        float DAO = VertexAO(Side0, Side1, Corner);
+                        vec4 D = vec4(XPos, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
 
-                            uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1);
-                            int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z);
-                            float CLightIntensity = CLightLevel / (CCount*15.0f);
-                            vec4 CColor = vec4(Color, CLightIntensity);
+                        uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1) ? 0 : 1);
+                        int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
+                        float DLightIntensity = DLightLevel / (DCount*15.0f);
+                        vec4 DColor = vec4(Color, DLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
-                            float DAO = VertexAO(Side0, Side1, Corner);
-                            vec4 D = vec4(XPos, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
+                        PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
+                    }
 
-                            uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1) ? 0 : 1);
-                            int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
-                            float DLightIntensity = DLightLevel / (DCount*15.0f);
-                            vec4 DColor = vec4(Color, DLightIntensity);
+                    if((X == (CHUNK_DIM_X - 1)) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X + 1, Y, Z)))
+                    {
+                        int8_t Side0, Side1, Corner;
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1);
+                        float AAO = VertexAO(Side0, Side1, Corner);
+                        vec4 A = vec4(XPos + BlockDimInMeters, YPos, ZPos, AAO);
+                        
+                        uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1);
+                        int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z);
+                        float ALightIntensity = ALightLevel / (ACount*15.0f);
+                        vec4 AColor = vec4(Color, ALightIntensity);
 
-                            PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
-                        }
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
+                        float BAO = VertexAO(Side0, Side1, Corner);
+                        vec4 B = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos, BAO);
 
-                        if((X == (CHUNK_DIM_X - 1)) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X + 1, Y, Z)))
-                        {
-                            int8_t Side0, Side1, Corner;
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1);
-                            float AAO = VertexAO(Side0, Side1, Corner);
-                            vec4 A = vec4(XPos + BlockDimInMeters, YPos, ZPos, AAO);
-                            
-                            uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1);
-                            int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z);
-                            float ALightIntensity = ALightLevel / (ACount*15.0f);
-                            vec4 AColor = vec4(Color, ALightIntensity);
+                        uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1);
+                        int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z);
+                        float BLightIntensity = BLightLevel / (BCount*15.0f);
+                        vec4 BColor = vec4(Color, BLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
-                            float BAO = VertexAO(Side0, Side1, Corner);
-                            vec4 B = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos, BAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
+                        float CAO = VertexAO(Side0, Side1, Corner);
+                        vec4 C = vec4(XPos + BlockDimInMeters, YPos, ZPos + BlockDimInMeters, CAO);
 
-                            uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1);
-                            int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z);
-                            float BLightIntensity = BLightLevel / (BCount*15.0f);
-                            vec4 BColor = vec4(Color, BLightIntensity);
+                        uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1);
+                        int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1);
+                        float CLightIntensity = CLightLevel / (CCount*15.0f);
+                        vec4 CColor = vec4(Color, CLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
-                            float CAO = VertexAO(Side0, Side1, Corner);
-                            vec4 C = vec4(XPos + BlockDimInMeters, YPos, ZPos + BlockDimInMeters, CAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
+                        float DAO = VertexAO(Side0, Side1, Corner);
+                        vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
 
-                            uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1);
-                            int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1);
-                            float CLightIntensity = CLightLevel / (CCount*15.0f);
-                            vec4 CColor = vec4(Color, CLightIntensity);
+                        uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1) ? 0 : 1);
+                        int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
+                        float DLightIntensity = DLightLevel / (DCount*15.0f);
+                        vec4 DColor = vec4(Color, DLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
-                            float DAO = VertexAO(Side0, Side1, Corner);
-                            vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
+                        PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
+                    }
 
-                            uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1) ? 0 : 1);
-                            int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
-                            float DLightIntensity = DLightLevel / (DCount*15.0f);
-                            vec4 DColor = vec4(Color, DLightIntensity);
+                    if((Y == 0) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y - 1, Z)))
+                    {
+                        int8_t Side0, Side1, Corner;
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1);
+                        float AAO = VertexAO(Side0, Side1, Corner);
+                        vec4 A = vec4(XPos, YPos, ZPos, AAO);
 
-                            PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
-                        }
+                        uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1);
+                        int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z);
+                        float ALightIntensity = ALightLevel / (ACount*15.0f);
+                        vec4 AColor = vec4(Color, ALightIntensity);
 
-                        if((Y == 0) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y - 1, Z)))
-                        {
-                            int8_t Side0, Side1, Corner;
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1);
-                            float AAO = VertexAO(Side0, Side1, Corner);
-                            vec4 A = vec4(XPos, YPos, ZPos, AAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1);
+                        float BAO = VertexAO(Side0, Side1, Corner);
+                        vec4 B = vec4(XPos + BlockDimInMeters, YPos, ZPos, BAO);
 
-                            uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1);
-                            int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z);
-                            float ALightIntensity = ALightLevel / (ACount*15.0f);
-                            vec4 AColor = vec4(Color, ALightIntensity);
+                        uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1);
+                        int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z);
+                        float BLightIntensity = BLightLevel / (BCount*15.0f);
+                        vec4 BColor = vec4(Color, BLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1);
-                            float BAO = VertexAO(Side0, Side1, Corner);
-                            vec4 B = vec4(XPos + BlockDimInMeters, YPos, ZPos, BAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1);
+                        float CAO = VertexAO(Side0, Side1, Corner);
+                        vec4 C = vec4(XPos, YPos, ZPos + BlockDimInMeters, CAO);
 
-                            uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1);
-                            int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z-1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z);
-                            float BLightIntensity = BLightLevel / (BCount*15.0f);
-                            vec4 BColor = vec4(Color, BLightIntensity);
+                        uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1);
+                        int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1);
+                        float CLightIntensity = CLightLevel / (CCount*15.0f);
+                        vec4 CColor = vec4(Color, CLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1);
-                            float CAO = VertexAO(Side0, Side1, Corner);
-                            vec4 C = vec4(XPos, YPos, ZPos + BlockDimInMeters, CAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
+                        float DAO = VertexAO(Side0, Side1, Corner);
+                        vec4 D = vec4(XPos + BlockDimInMeters, YPos, ZPos + BlockDimInMeters, DAO);
 
-                            uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1);
-                            int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z+1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1);
-                            float CLightIntensity = CLightLevel / (CCount*15.0f);
-                            vec4 CColor = vec4(Color, CLightIntensity);
+                        uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1) ? 0 : 1);
+                        int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
+                        float DLightIntensity = DLightLevel / (DCount*15.0f);
+                        vec4 DColor = vec4(Color, DLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
-                            float DAO = VertexAO(Side0, Side1, Corner);
-                            vec4 D = vec4(XPos + BlockDimInMeters, YPos, ZPos + BlockDimInMeters, DAO);
+                        PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
+                    }
 
-                            uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1) ? 0 : 1);
-                            int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
-                            float DLightIntensity = DLightLevel / (DCount*15.0f);
-                            vec4 DColor = vec4(Color, DLightIntensity);
+                    if((Y == (CHUNK_DIM_Y - 1)) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y + 1, Z)))
+                    {
+                        int8_t Side0, Side1, Corner;
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1);
+                        float AAO = VertexAO(Side0, Side1, Corner);
+                        vec4 A = vec4(XPos, YPos + BlockDimInMeters, ZPos, AAO);
 
-                            PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
-                        }
+                        uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1);
+                        int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z);
+                        float ALightIntensity = ALightLevel / (ACount*15.0f);
+                        vec4 AColor = vec4(Color, ALightIntensity);
 
-                        if((Y == (CHUNK_DIM_Y - 1)) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y + 1, Z)))
-                        {
-                            int8_t Side0, Side1, Corner;
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1);
-                            float AAO = VertexAO(Side0, Side1, Corner);
-                            vec4 A = vec4(XPos, YPos + BlockDimInMeters, ZPos, AAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
+                        float BAO = VertexAO(Side0, Side1, Corner);
+                        vec4 B = vec4(XPos, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, BAO);
 
-                            uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1);
-                            int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z);
-                            float ALightIntensity = ALightLevel / (ACount*15.0f);
-                            vec4 AColor = vec4(Color, ALightIntensity);
+                        uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1);
+                        int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1);
+                        float BLightIntensity = BLightLevel / (BCount*15.0f);
+                        vec4 BColor = vec4(Color, BLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
-                            float BAO = VertexAO(Side0, Side1, Corner);
-                            vec4 B = vec4(XPos, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, BAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
+                        float CAO = VertexAO(Side0, Side1, Corner);
+                        vec4 C = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos, CAO);
 
-                            uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1);
-                            int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z+1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1);
-                            float BLightIntensity = BLightLevel / (BCount*15.0f);
-                            vec4 BColor = vec4(Color, BLightIntensity);
+                        uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1);
+                        int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z);
+                        float CLightIntensity = CLightLevel / (CCount*15.0f);
+                        vec4 CColor = vec4(Color, CLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
-                            float CAO = VertexAO(Side0, Side1, Corner);
-                            vec4 C = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos, CAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
+                        float DAO = VertexAO(Side0, Side1, Corner);
+                        vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
 
-                            uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1);
-                            int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z-1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z);
-                            float CLightIntensity = CLightLevel / (CCount*15.0f);
-                            vec4 CColor = vec4(Color, CLightIntensity);
+                        uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1) ? 0 : 1);
+                        int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
+                        float DLightIntensity = DLightLevel / (DCount*15.0f);
+                        vec4 DColor = vec4(Color, DLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
-                            float DAO = VertexAO(Side0, Side1, Corner);
-                            vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
+                        PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
+                    }
 
-                            uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1) ? 0 : 1);
-                            int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1) +
-                                                    GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
-                            float DLightIntensity = DLightLevel / (DCount*15.0f);
-                            vec4 DColor = vec4(Color, DLightIntensity);
+                    if((Z == 0) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z - 1)))
+                    {
+                        int8_t Side0, Side1, Corner;
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1);
+                        float AAO = VertexAO(Side0, Side1, Corner);
+                        vec4 A = vec4(XPos, YPos, ZPos, AAO);
+                        
+                        uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1);
+                        int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1);
+                        float ALightIntensity = ALightLevel / (ACount*15.0f);
+                        vec4 AColor = vec4(Color, ALightIntensity);
 
-                            PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
-                        }
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1);
+                        float BAO = VertexAO(Side0, Side1, Corner);
+                        vec4 B = vec4(XPos, YPos + BlockDimInMeters, ZPos, BAO);
+                        
+                        uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1);
+                        int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1);
+                        float BLightIntensity = BLightLevel / (BCount*15.0f);
+                        vec4 BColor = vec4(Color, BLightIntensity);
 
-                        if((Z == 0) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z - 1)))
-                        {
-                            int8_t Side0, Side1, Corner;
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1);
-                            float AAO = VertexAO(Side0, Side1, Corner);
-                            vec4 A = vec4(XPos, YPos, ZPos, AAO);
-                            
-                            uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1);
-                            int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1);
-                            float ALightIntensity = ALightLevel / (ACount*15.0f);
-                            vec4 AColor = vec4(Color, ALightIntensity);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1);
+                        float CAO = VertexAO(Side0, Side1, Corner);
+                        vec4 C = vec4(XPos + BlockDimInMeters, YPos, ZPos, CAO);
+                                                    
+                        uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1);
+                        int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1);
+                        float CLightIntensity = CLightLevel / (CCount*15.0f);
+                        vec4 CColor = vec4(Color, CLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1);
-                            float BAO = VertexAO(Side0, Side1, Corner);
-                            vec4 B = vec4(XPos, YPos + BlockDimInMeters, ZPos, BAO);
-                            
-                            uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1);
-                            int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1);
-                            float BLightIntensity = BLightLevel / (BCount*15.0f);
-                            vec4 BColor = vec4(Color, BLightIntensity);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
+                        float DAO = VertexAO(Side0, Side1, Corner);
+                        vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos, DAO);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1);
-                            float CAO = VertexAO(Side0, Side1, Corner);
-                            vec4 C = vec4(XPos + BlockDimInMeters, YPos, ZPos, CAO);
-                                                        
-                            uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1);
-                            int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1);
-                            float CLightIntensity = CLightLevel / (CCount*15.0f);
-                            vec4 CColor = vec4(Color, CLightIntensity);
+                        uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1) ? 0 : 1);
+                        int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
+                        float DLightIntensity = DLightLevel / (DCount*15.0f);
+                        vec4 DColor = vec4(Color, DLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
-                            float DAO = VertexAO(Side0, Side1, Corner);
-                            vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos, DAO);
+                        PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
+                    }
 
-                            uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z-1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z-1) ? 0 : 1);
-                            int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z-1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z-1);
-                            float DLightIntensity = DLightLevel / (DCount*15.0f);
-                            vec4 DColor = vec4(Color, DLightIntensity);
+                    if((Z == (CHUNK_DIM_Z - 1)) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z + 1)))
+                    {
+                        int8_t Side0, Side1, Corner;
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1);
+                        float AAO = VertexAO(Side0, Side1, Corner);
+                        vec4 A = vec4(XPos, YPos, ZPos + BlockDimInMeters, AAO);
+                        
+                        uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1);
+                        int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1);
+                        float ALightIntensity = ALightLevel / (ACount*15.0f);
+                        vec4 AColor = vec4(Color, ALightIntensity);
 
-                            PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
-                        }
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
+                        float BAO = VertexAO(Side0, Side1, Corner);
+                        vec4 B = vec4(XPos + BlockDimInMeters, YPos, ZPos + BlockDimInMeters, BAO);
 
-                        if((Z == (CHUNK_DIM_Z - 1)) || (!IsBlockSolid(Chunk->BlocksInfo->Blocks, X, Y, Z + 1)))
-                        {
-                            int8_t Side0, Side1, Corner;
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1);
-                            float AAO = VertexAO(Side0, Side1, Corner);
-                            vec4 A = vec4(XPos, YPos, ZPos + BlockDimInMeters, AAO);
-                            
-                            uint32_t ACount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1);
-                            int8_t ALightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y-1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1);
-                            float ALightIntensity = ALightLevel / (ACount*15.0f);
-                            vec4 AColor = vec4(Color, ALightIntensity);
+                        uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1);
+                        int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1);
+                        float BLightIntensity = BLightLevel / (BCount*15.0f);
+                        vec4 BColor = vec4(Color, BLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1);
-                            float BAO = VertexAO(Side0, Side1, Corner);
-                            vec4 B = vec4(XPos + BlockDimInMeters, YPos, ZPos + BlockDimInMeters, BAO);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
+                        float CAO = VertexAO(Side0, Side1, Corner);
+                        vec4 C = vec4(XPos, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, CAO);
+                        
+                        uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1);
+                        int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1);
+                        float CLightIntensity = CLightLevel / (CCount*15.0f);
+                        vec4 CColor = vec4(Color, CLightIntensity);
 
-                            uint32_t BCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y-1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1);
-                            int8_t BLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y-1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y-1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1);
-                            float BLightIntensity = BLightLevel / (BCount*15.0f);
-                            vec4 BColor = vec4(Color, BLightIntensity);
+                        Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
+                        Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
+                        Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
+                        float DAO = VertexAO(Side0, Side1, Corner);
+                        vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1);
-                            float CAO = VertexAO(Side0, Side1, Corner);
-                            vec4 C = vec4(XPos, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, CAO);
-                            
-                            uint32_t CCount = (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X-1, Y+1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1);
-                            int8_t CLightLevel = GetLightLevelBetweenChunks(World, Chunk, X-1, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X-1, Y+1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1);
-                            float CLightIntensity = CLightLevel / (CCount*15.0f);
-                            vec4 CColor = vec4(Color, CLightIntensity);
+                        uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1) +
+                                            (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1) ? 0 : 1);
+                        int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1) +
+                                                GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
+                        float DLightIntensity = DLightLevel / (DCount*15.0f);
+                        vec4 DColor = vec4(Color, DLightIntensity);
 
-                            Side0 = IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1);
-                            Side1 = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1);
-                            Corner = IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
-                            float DAO = VertexAO(Side0, Side1, Corner);
-                            vec4 D = vec4(XPos + BlockDimInMeters, YPos + BlockDimInMeters, ZPos + BlockDimInMeters, DAO);
-
-                            uint32_t DCount = (IsBlockSolidBetweenChunks(World, Chunk, X, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X, Y+1, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y, Z+1) ? 0 : 1) +
-                                              (IsBlockSolidBetweenChunks(World, Chunk, X+1, Y+1, Z+1) ? 0 : 1);
-                            int8_t DLightLevel = GetLightLevelBetweenChunks(World, Chunk, X, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X, Y+1, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y, Z+1) +
-                                                 GetLightLevelBetweenChunks(World, Chunk, X+1, Y+1, Z+1);
-                            float DLightIntensity = DLightLevel / (DCount*15.0f);
-                            vec4 DColor = vec4(Color, DLightIntensity);
-
-                            PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
-                        }
+                        PushVoxelFaceVertices(Chunk, A, B, C, D, AColor, BColor, CColor, DColor, ((CAO+BAO) >= (AAO + DAO)));
                     }
                 }
             }
         }
-
-        SetFlags(Chunk, CHUNK_SETUP);
     }
+}
+
+struct setup_chunk_job
+{
+    world *World;
+    chunk *Chunk;
+};
+static void
+SetupChunk(void *Data)
+{
+    setup_chunk_job *Job = (setup_chunk_job *)Data;
+    world *World = Job->World;
+    chunk *Chunk = Job->Chunk;
+
+    InitializeDynamicArray(&Chunk->Vertices); 
+    InitializeDynamicArray(&Chunk->Indices); 
+    GenerateChunkVertices(World, Chunk);
+
+    _WriteBarrier();
+    SetFlags(Chunk, CHUNK_SETUP);
+}
+
+static void
+SetupChunks(temp_state *TempState)
+{
+    for(uint32_t ChunkIndex = 0;
+        ChunkIndex < TempState->World.ChunksToSetupCount;
+        ChunkIndex++)
+    {
+        chunk *Chunk = TempState->World.ChunksToSetup[ChunkIndex];
+        Assert(!CheckFlag(Chunk, CHUNK_SETUP));
+
+        setup_chunk_job *Job = PushStruct(&TempState->TempAllocator, setup_chunk_job);
+        Job->World = &TempState->World;
+        Job->Chunk = Chunk;
+
+        JobSystemAddEntry(TempState->JobSystemQueue, SetupChunk, Job);    
+    }
+
+    JobSystemCompleteAllWork(TempState->JobSystemQueue);
 }
 
 static void
@@ -1609,6 +1912,7 @@ LoadChunks(world *World)
 
         glGenVertexArrays(1, &Chunk->VAO);
         glGenBuffers(1, &Chunk->VBO);
+        glGenBuffers(1, &Chunk->EBO);
         glBindVertexArray(Chunk->VAO);
         glBindBuffer(GL_ARRAY_BUFFER, Chunk->VBO);
         glBufferData(GL_ARRAY_BUFFER, Chunk->Vertices.EntriesCount*sizeof(vec4), Chunk->Vertices.Entries, GL_STATIC_DRAW);
@@ -1616,12 +1920,37 @@ LoadChunks(world *World)
 		glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 2*sizeof(vec4), (void*)0);
         glEnableVertexAttribArray(1);
 		glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 2*sizeof(vec4), (void*)(sizeof(vec4)));
+		glGenBuffers(1, &Chunk->EBO);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, Chunk->EBO);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, Chunk->Indices.EntriesCount*sizeof(uint32_t), Chunk->Indices.Entries, GL_STATIC_DRAW);
 
         SetFlags(Chunk, CHUNK_LOADED);
     }
 
     glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+
+static void
+UpdateChunk(world *World, chunk *Chunk)
+{
+    Chunk->Vertices.EntriesCount = 0;
+    Chunk->Indices.EntriesCount = 0;
+    GenerateChunkVertices(World, Chunk);
+
+    glBindVertexArray(Chunk->VAO);
+    glBindBuffer(GL_ARRAY_BUFFER, Chunk->VBO);
+    glBufferData(GL_ARRAY_BUFFER, Chunk->Vertices.EntriesCount*sizeof(vec4), Chunk->Vertices.Entries, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 2*sizeof(vec4), (void*)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 2*sizeof(vec4), (void*)(sizeof(vec4)));
+    glGenBuffers(1, &Chunk->EBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, Chunk->EBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, Chunk->Indices.EntriesCount*sizeof(uint32_t), Chunk->Indices.Entries, GL_STATIC_DRAW);
+
+    ClearFlags(Chunk, CHUNK_MODIFIED);
 }
 
 static void
@@ -1674,9 +2003,10 @@ UnloadChunks(world *World, world_position *MinChunkP, world_position *MaxChunkP)
 
                     if(CheckFlag(Chunk, CHUNK_LOADED))
                     {
+                        glDeleteBuffers(1, &Chunk->EBO);
                         glDeleteBuffers(1, &Chunk->VBO);
                         glDeleteVertexArrays(1, &Chunk->VAO);
-                        Chunk->VAO = Chunk->VBO = 0;
+                        Chunk->VAO = Chunk->VBO = Chunk->EBO = 0;
 
                         ClearFlags(Chunk, CHUNK_LOADED);
                     }
@@ -1832,7 +2162,7 @@ RenderChunks(world *World, shader Shader, mat4 VP, stack_allocator *WorldAllocat
         {
             Shader.SetMat4("Model", ChunkTranslationMatrix);
             glBindVertexArray(Chunk->VAO);
-            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)Chunk->Vertices.EntriesCount);
+			glDrawElements(GL_TRIANGLES, (GLsizei)Chunk->Indices.EntriesCount, GL_UNSIGNED_INT, 0);
         }
     }
 
@@ -1944,6 +2274,11 @@ BeginSimulation(world *World, world_position *Origin, vec2 Bounds, stack_allocat
                     }
                     else
                     {
+                        if(CheckFlag(Chunk, CHUNK_MODIFIED))
+                        {
+                            UpdateChunk(World, Chunk);
+                        }
+
                         Assert(World->ChunksToRenderCount < ArrayCount(World->ChunksToRender));
                         World->ChunksToRender[World->ChunksToRenderCount++] = Chunk;
 
@@ -1963,41 +2298,6 @@ BeginSimulation(world *World, world_position *Origin, vec2 Bounds, stack_allocat
     }
 }
 
-struct camera
-{
-    vec3 P;
-    vec3 ViewDir;
-
-    float Pitch, Head;
-
-    mat4 GetViewMatrix(void);
-};
-inline mat4
-camera::GetViewMatrix(void)
-{
-    mat4 Result = LookAt(P, P + ViewDir);
-    return(Result);
-}
-
-struct game_state
-{
-    bool IsInitialized;
-
-    camera Camera;
-    world_position HeroP;
-
-    shader DefaultShader;
-
-    GLuint CubeVAO, CubeVBO;
-};
-
-struct temp_state
-{
-    bool IsInitialized;
-
-    stack_allocator WorldAllocator;
-    world World;
-};
 
 static void
 GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth, uint32_t BufferHeight)
@@ -2006,10 +2306,35 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
     game_state *GameState = (game_state *)Memory->PermanentStorage;
     if(!GameState->IsInitialized)
     {
+        GameState->Gravity = true;
         GameState->DefaultShader = shader("shaders\\DefaultVS.glsl", "shaders\\DefaultFS.glsl");
+        GameState->ScreenShader = shader("shaders\\ScreenVS.glsl", "shaders\\ScreenFS.glsl");
+
+        GameState->CrossHairTexture = LoadTexture("textures\\crosshair.png");
+
+        float QuadVertices[] =
+        {
+            -0.5f, 0.5f,
+            -0.5f, -0.5f,
+            0.5f, 0.5f,
+            0.5f, -0.5f
+        };
+
+        glGenVertexArrays(1, &GameState->QuadVAO);
+        glGenBuffers(1, &GameState->QuadVBO);
+        glBindVertexArray(GameState->QuadVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, GameState->QuadVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(QuadVertices), QuadVertices, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         GameState->Camera = {};
-		GameState->Camera.P = vec3(0.0f, 56.0f, 0.0f);
+        GameState->Camera.P = vec3(0.0f, 0.5f, 0.0f);
+
+        GameState->Hero = {};
+        GameState->Hero.WorldP.Offset.y = 70.0f;
 
         GameState->IsInitialized = true;
     }
@@ -2032,11 +2357,16 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         InitializeStackAllocator(&TempState->WorldAllocator, Memory->TemporaryStorageSize - sizeof(temp_state), 
                                                              (uint8_t *)Memory->TemporaryStorage + sizeof(temp_state));
 
+        TempState->TempAllocator = SubAlloctor(&TempState->WorldAllocator, Megabytes(32));
+
+        TempState->JobSystemQueue = Memory->JobSystemQueue;
+
         TempState->IsInitialized = true;
     }
 
     camera *Camera = &GameState->Camera;
     world *World = &TempState->World;
+	hero *Hero = &GameState->Hero;
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -2048,33 +2378,45 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
     Camera->ViewDir.x = -Cos(Radians(Camera->Pitch))*Sin(Radians(Camera->Head));
     Camera->ViewDir.y = Sin(Radians(Camera->Pitch));
     Camera->ViewDir.z = -Cos(Radians(Camera->Pitch))*Cos(Radians(Camera->Head));
+    Camera->ViewDir = Normalize(Camera->ViewDir);
 
     vec3 CameraRight = Normalize(Cross(Camera->ViewDir, vec3(0.0f, 1.0f, 0.0f)));
 
-    vec3 Offset = vec3(0.0f, 0.0f, 0.0f);
+    vec3 HeroMovementDir = Normalize(vec3(Camera->ViewDir.x, 0.0f, Camera->ViewDir.z));
+    vec3 HeroRightDir = Normalize(vec3(CameraRight.x, 0.0f, CameraRight.z));
+    Hero->ddP = vec3(0.0f, 0.0f, 0.0f);
     if(Input->MoveForward.EndedDown)
     {
-        Offset += 40.0f*Input->dt*Camera->ViewDir;
+        Hero->ddP += HeroMovementDir;
     }
     if(Input->MoveBack.EndedDown)
     {
-        Offset -= 40.0f*Input->dt*Camera->ViewDir;
+        Hero->ddP += -HeroMovementDir;
     }
     if(Input->MoveRight.EndedDown)
     {
-        Offset += 40.0f*Input->dt*CameraRight;
+        Hero->ddP += HeroRightDir;
     }
     if(Input->MoveLeft.EndedDown)
     {
-        Offset -= 40.0f*Input->dt*CameraRight;
+        Hero->ddP += -HeroRightDir;
+    }
+    if(WasDown(&Input->MoveUp))
+    {
+        if(Hero->CanJump)
+        {
+            Hero->dP.y = 5.0f;
+        }
     }
 
-    BeginSimulation(World, &GameState->HeroP, vec2(100.0f, 100.0f), &TempState->WorldAllocator);
-    GenerateChunks(World, &TempState->WorldAllocator);
-    PlaceTreesChunks(World);
-    PropagateLightChunks(World);
-    FinishPropagateLightChunks(World);
-    SetupChunks(World);
+    BeginSimulation(World, &Hero->WorldP, vec2(75.0f, 75.0f), &TempState->WorldAllocator);
+
+    stack_temp_memory TempMemory = BeginTempMemory(&TempState->TempAllocator);
+    GenerateChunks(TempState);
+    PlaceTreesChunks(TempState);
+    PropagateLightChunks(TempState);
+    FinishPropagateLightChunks(TempState);
+    SetupChunks(TempState);
     LoadChunks(World);
 
     mat4 PerspectiveProj = Perspective(45.0f, (float)BufferWidth/(float)BufferHeight, 0.1f, 500.0f);
@@ -2086,7 +2428,304 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
     GameState->DefaultShader.SetVec2("Resolution", vec2((float)BufferWidth, (float)BufferHeight));
     RenderChunks(World, GameState->DefaultShader, PerspectiveProj * View, &TempState->WorldAllocator);
 
-    GameState->HeroP = MapIntoChunkSpace(World, &GameState->HeroP, Offset);
-    
+    Hero->ddP = 20.0f*NOZ(Hero->ddP);
+    vec3 Drag = -2.0f*Hero->dP;
+    Drag.y = 0.0f;
+    Hero->ddP += Drag;
+    if(GameState->Gravity)
+	{
+		Hero->ddP.y += -9.8f;
+	}
+
+    Hero->dP += Input->dt*Hero->ddP;
+    vec3 HeroDeltaP = Input->dt*Hero->dP;
+
+    aabb HeroAABB = AABBMinMax(vec3(-0.5f, -0.5f, -0.5f), vec3(0.5f, 0.5f, 0.5f));
+
+    aabb SweptAABB = {};
+    {
+        vec3 Min, Max;
+        Min.x = (HeroDeltaP.x > 0.0f) ? HeroAABB.Min.x : HeroAABB.Min.x + HeroDeltaP.x;
+        Min.y = (HeroDeltaP.y > 0.0f) ? HeroAABB.Min.y : HeroAABB.Min.y + HeroDeltaP.y;
+        Min.z = (HeroDeltaP.z > 0.0f) ? HeroAABB.Min.z : HeroAABB.Min.z + HeroDeltaP.z;
+        Max.x = (HeroDeltaP.x > 0.0f) ? HeroAABB.Max.x + HeroDeltaP.x : HeroAABB.Max.x;
+        Max.y = (HeroDeltaP.y > 0.0f) ? HeroAABB.Max.y + HeroDeltaP.y : HeroAABB.Max.y;
+        Max.z = (HeroDeltaP.z > 0.0f) ? HeroAABB.Max.z + HeroDeltaP.z : HeroAABB.Max.z;
+
+        SweptAABB = AABBMinMax(Min, Max);
+    }
+
+    uint32_t ChunksInBroadPhaseCount = 0;
+    chunk *ChunksInBroadPhase[8];
+    for(uint32_t ChunkIndex = 0;
+        ChunkIndex < World->ChunksToRenderCount;
+        ChunkIndex++)
+    {
+        chunk *Chunk = World->ChunksToRender[ChunkIndex];
+        
+        aabb ChunkAABB = AABBMinMax(Chunk->SimP,
+                                    Chunk->SimP + World->ChunkDimInMeters);
+
+        if(Intersect(SweptAABB, ChunkAABB))
+        {
+            Assert(ChunksInBroadPhaseCount < (ArrayCount(ChunksInBroadPhase)));
+            ChunksInBroadPhase[ChunksInBroadPhaseCount++] = Chunk;
+        }
+    }
+
+    uint32_t BlocksInBroadPhaseCount = 0;
+    aabb BlocksInBroadPhase[128];
+    for(uint32_t ChunkIndex = 0;
+        ChunkIndex < ChunksInBroadPhaseCount;
+        ChunkIndex++)
+    {
+        chunk *Chunk = ChunksInBroadPhase[ChunkIndex];
+
+        for(uint32_t ZBlock = 0; ZBlock < CHUNK_DIM_Z; ZBlock++)
+        {
+            for(uint32_t XBlock = 0; XBlock < CHUNK_DIM_X; XBlock++)
+            {
+                for(uint32_t YBlock = 0; YBlock < CHUNK_DIM_Y; YBlock++)
+                {
+                    if(IsBlockSolid(Chunk->BlocksInfo->Blocks, XBlock, YBlock, ZBlock))
+                    {
+                        vec3 BlockMin = Chunk->SimP + vec3(XBlock*World->BlockDimInMeters,
+                                                           YBlock*World->BlockDimInMeters,
+                                                           ZBlock*World->BlockDimInMeters);
+                        vec3 BlockMax = Chunk->SimP + vec3((XBlock + 1)*World->BlockDimInMeters,
+                                                           (YBlock + 1)*World->BlockDimInMeters,
+                                                           (ZBlock + 1)*World->BlockDimInMeters);
+                        aabb BlockAABB = AABBMinMax(BlockMin, BlockMax);
+
+                        if(Intersect(SweptAABB, BlockAABB))
+                        {
+                            Assert(BlocksInBroadPhaseCount < ArrayCount(BlocksInBroadPhase));
+                            BlocksInBroadPhase[BlocksInBroadPhaseCount++] = BlockAABB;
+                        }
+                    }
+                }    
+            }
+        }
+    }
+
+    for(uint32_t Iteration = 0; Iteration < 4; Iteration++)
+    {
+        float HeroDeltaLength = Length(HeroDeltaP);
+        if(HeroDeltaLength > 0.0f)
+        {
+            vec3 DesiredP = Hero->P + HeroDeltaP;
+            vec3 Normal = vec3(0.0f, 0.0f, 0.0f);
+            float t = 1.0f;
+
+            bool WasCollision = false;
+            for(uint32_t BlockIndex = 0;
+                BlockIndex < BlocksInBroadPhaseCount;
+                )
+            {
+                aabb BlockAABB = BlocksInBroadPhase[BlockIndex];
+
+                vec3 N = vec3(0.0f, 0.0f, 0.0f);
+                float tFirst = 0.0f;
+
+                intersect_moving_aabbs_result IntersectRes = IntersectMovingAABBs(HeroAABB, BlockAABB, HeroDeltaP, &N, &tFirst);
+                if(IntersectRes == INTERSECT_AT_START)
+                {
+                    Hero->P += tFirst*N;
+                    HeroAABB = Translate(HeroAABB, tFirst*N);
+                    DesiredP += tFirst*N;
+                }
+                else if(IntersectRes == INTERSECT_MOVING)
+                {
+                    WasCollision = true;
+
+                    if(tFirst < t)
+                    {
+                        t = tFirst;
+                        Normal = N;
+                    }
+
+                    BlockIndex++;
+                }
+                else
+                {
+                    BlockIndex++;
+                }
+            }
+
+            Hero->P += t*HeroDeltaP;
+            HeroAABB = Translate(HeroAABB, t*HeroDeltaP);
+            HeroDeltaP = DesiredP - Hero->P;
+            if(WasCollision)
+            {
+                HeroDeltaP -= 1.01f*Dot(HeroDeltaP, Normal)*Normal;
+                Hero->dP -= 1.01f*Dot(Hero->dP, Normal)*Normal;
+            }
+        }
+    }
+
+    segment Segments[] = 
+    {
+        {Hero->P, Hero->P + vec3(0.0f, -0.6f, 0.0f)},
+        {Hero->P + vec3(-0.5f, 0.0f, -0.5f), Hero->P + vec3(-0.5f, 0.0f, -0.5f) + vec3(0.0f, -0.6f, 0.0f)},
+        {Hero->P + vec3(-0.5f, 0.0f, 0.5f), Hero->P + vec3(-0.5f, 0.0f, 0.5f) + vec3(0.0f, -0.6f, 0.0f)},
+        {Hero->P + vec3(0.5f, 0.0f, 0.5f), Hero->P + vec3(0.5f, 0.0f, 0.5f) + vec3(0.0f, -0.6f, 0.0f)},
+        {Hero->P + vec3(0.5f, 0.0f, -0.5f), Hero->P + vec3(0.5f, 0.0f, -0.5f) + vec3(0.0f, -0.6f, 0.0f)},
+    };
+    bool Intersect = false;
+    for(uint32_t SegmentIndex = 0; 
+        (SegmentIndex < ArrayCount(Segments)) && !Intersect;
+        SegmentIndex++)
+    {
+        segment Segment = Segments[SegmentIndex];
+
+        for(uint32_t BlockIndex = 0;
+            BlockIndex < BlocksInBroadPhaseCount;
+            BlockIndex++)
+        {
+            aabb BlockAABB = BlocksInBroadPhase[BlockIndex];
+            
+            float t;
+            Intersect = IntersectSegmentAABB(Segment, BlockAABB, &t);
+            if(Intersect) break;
+        }
+    }
+    Hero->CanJump = Intersect;
+
+    if(WasDown(&Input->MouseRight))
+    {
+        world_position NewHeroWorldP = MapIntoChunkSpace(World, &Hero->WorldP, Hero->P);
+
+        chunk *Chunk = GetChunk(World, NewHeroWorldP.ChunkX, NewHeroWorldP.ChunkZ);
+        int32_t BlockX = (int32_t)(NewHeroWorldP.Offset.x / World->BlockDimInMeters);
+        int32_t BlockY = (int32_t)(NewHeroWorldP.Offset.y / World->BlockDimInMeters);
+        int32_t BlockZ = (int32_t)(NewHeroWorldP.Offset.z / World->BlockDimInMeters);
+        std::cout << "Chunk: (" << Chunk->X << ", " << Chunk->Z << ") Block: (" << BlockX << ", " << BlockY << ", " << BlockZ << ")\n";
+
+        chunk *LastChunk = Chunk;
+        int32_t LastFreeBlockX = BlockX;
+        int32_t LastFreeBlockY = BlockY;
+        int32_t LastFreeBlockZ = BlockZ;
+
+#if 1
+        vec3 RayP = Hero->P + Camera->P;
+        vec3 RayDir = Camera->ViewDir;
+        for(uint32_t BlockIndex = 0; BlockIndex < 10; BlockIndex++)
+        {
+            float XBorderDist = FLT_MAX;
+            if(RayDir.x > 0.0f)
+            {
+                float PlaneD = Chunk->SimP.x + (BlockX + 1)*World->BlockDimInMeters;
+                vec3 PlaneN = vec3(1.0f, 0.0f, 0.0f);
+
+                XBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+            }
+            else if(RayDir.x < 0.0f)
+            {
+                float PlaneD = Chunk->SimP.x + BlockX*World->BlockDimInMeters;
+                vec3 PlaneN = vec3(1.0f, 0.0f, 0.0f);
+
+                XBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+            }
+
+            float YBorderDist = FLT_MAX;
+            if(RayDir.y > 0.0f)
+            {
+                float PlaneD = Chunk->SimP.y + (BlockY + 1)*World->BlockDimInMeters;
+                vec3 PlaneN = vec3(0.0f, 1.0f, 0.0f);
+
+                YBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+            }
+            else if(RayDir.y < 0.0f)
+            {
+                float PlaneD = Chunk->SimP.y + BlockY*World->BlockDimInMeters;
+                vec3 PlaneN = vec3(0.0f, 1.0f, 0.0f);
+
+                YBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+            }
+            
+            float ZBorderDist = FLT_MAX;
+            if(RayDir.z > 0.0f)
+            {
+                float PlaneD = Chunk->SimP.z + (BlockZ + 1)*World->BlockDimInMeters;
+                vec3 PlaneN = vec3(0.0f, 0.0f, 1.0f);
+
+                ZBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+            }
+            else if(RayDir.z < 0.0f)
+            {
+                float PlaneD = Chunk->SimP.z + BlockZ*World->BlockDimInMeters;
+                vec3 PlaneN = vec3(0.0f, 0.0f, 1.0f);
+
+                ZBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+            }
+
+            if(XBorderDist <= YBorderDist)
+            {
+                if(XBorderDist <= ZBorderDist)
+                {
+                    BlockX = (RayDir.x > 0.0f) ? BlockX + 1 : BlockX - 1;
+                    RayP += RayDir*(XBorderDist);
+                    Chunk = GetChunkForBlock(World, Chunk, BlockX, BlockY, BlockZ);
+                }
+                else
+                {
+                    BlockZ = (RayDir.z > 0.0f) ? BlockZ + 1 : BlockZ - 1;
+                    RayP += RayDir*(ZBorderDist);
+                    Chunk = GetChunkForBlock(World, Chunk, BlockX, BlockY, BlockZ);
+                }
+            }
+            else
+            {
+                if(YBorderDist <= ZBorderDist)
+                {
+                    BlockY = (RayDir.y > 0.0f) ? BlockY + 1 : BlockY - 1;
+                    RayP += RayDir*(YBorderDist);
+                }
+                else
+                {
+                    BlockZ = (RayDir.z > 0.0f) ? BlockZ + 1 : BlockZ - 1;
+                    RayP += RayDir*(ZBorderDist);
+                    Chunk = GetChunkForBlock(World, Chunk, BlockX, BlockY, BlockZ);
+                }
+            }
+
+            std::cout << "Chunk: (" << Chunk->X << ", " << Chunk->Z << ") Block: (" << BlockX << ", " << BlockY << ", " << BlockZ << ")\n";
+            if(IsBlockSolid(Chunk->BlocksInfo->Blocks, BlockX, BlockY, BlockZ))
+            {
+                BlockType(LastChunk->BlocksInfo->Blocks, LastFreeBlockX, LastFreeBlockY, LastFreeBlockZ) = block_type::BLOCK_SOIL;
+                BlockLightLevel(LastChunk->BlocksInfo->Blocks, LastFreeBlockX, LastFreeBlockY, LastFreeBlockZ) = 0;
+                BlockColor(LastChunk->BlocksInfo->Colors, LastFreeBlockX, LastFreeBlockY, LastFreeBlockZ) = vec3(1.0f, 0.0f, 0.0f);
+                SetFlags(LastChunk, CHUNK_MODIFIED);
+                break;
+            }
+            else
+            {
+                LastChunk = Chunk;
+                LastFreeBlockX = BlockX;
+                LastFreeBlockY = BlockY;
+                LastFreeBlockZ = BlockZ;
+            }
+        }
+#endif
+    }
+
+    Hero->WorldP = MapIntoChunkSpace(World, &Hero->WorldP, Hero->P);
+    Hero->P = vec3(0.0f, 0.0f, 0.0f);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    mat4 OrthoProj = Ortho(-0.5f*BufferHeight, 0.5f*BufferHeight, -0.5f*BufferWidth, 0.5f*BufferWidth, -0.1f, -100.0f);
+    mat4 Model = Scaling(25.0f);
+    GameState->ScreenShader.Use();
+    GameState->ScreenShader.SetMat4("Projection", OrthoProj);
+    GameState->ScreenShader.SetMat4("Model", Model);
+    GameState->ScreenShader.SetI32("Texture", 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, GameState->CrossHairTexture);
+    glBindVertexArray(GameState->QuadVAO);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_BLEND);
+
+    EndTempMemory(TempMemory);
     ResetWorldWork(World);
 }

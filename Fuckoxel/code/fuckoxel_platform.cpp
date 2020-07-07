@@ -22,24 +22,16 @@ struct game_input
 
 	union
 	{
-		button Buttons[4];
 		struct
 		{
 			button MoveForward;
 			button MoveBack;
 			button MoveRight;
 			button MoveLeft;
+			button MoveUp;;
 		};
+		button Buttons[5];
 	};
-};
-
-struct game_memory
-{
-	uint64_t PermanentStorageSize;
-	void *PermanentStorage;
-
-	uint64_t TemporaryStorageSize;
-	void *TemporaryStorage;
 };
 
 static bool
@@ -50,6 +42,26 @@ WasDown(button *Button)
 	
 	return(Result);
 }
+
+struct job_system_queue;
+typedef void job_system_callback(void *Data);
+static void JobSystemAddEntry(job_system_queue *JobSystem, job_system_callback *Callback, void *Data);
+static void JobSystemCompleteAllWork(job_system_queue *JobSystem);
+
+struct game_memory
+{
+	uint64_t PermanentStorageSize;
+	void *PermanentStorage;
+
+	uint64_t TemporaryStorageSize;
+	void *TemporaryStorage;
+
+	job_system_queue *JobSystemQueue;
+};
+
+
+#include <Windows.h>
+#include <intrin.h>
 
 #include "fuckoxel.cpp"
 
@@ -110,6 +122,19 @@ GLFWKeyCallback(GLFWwindow *Window, int Key, int ScanCode, int Action, int Mods)
 			++Input->MoveBack.HalfTransitionCount;
 		}
 	}
+	if(Key == GLFW_KEY_SPACE)
+	{
+		if(Action == GLFW_PRESS)
+		{
+			Input->MoveUp.EndedDown = true;
+			++Input->MoveUp.HalfTransitionCount;
+		}
+		else if(Action == GLFW_RELEASE)
+		{
+			Input->MoveUp.EndedDown = false;
+			++Input->MoveUp.HalfTransitionCount;
+		}
+	}
 }
 
 static void
@@ -157,8 +182,120 @@ GLFWCursorPosCallback(GLFWwindow *Window, double XPos, double YPos)
 	Input->MouseY = (int)YPos;
 }
 
+struct job_system_entry
+{
+	job_system_callback *Callback;
+	void *Data;
+};
+struct job_system_queue
+{
+	uint32_t volatile JobsToCompleteCount;
+	uint32_t volatile JobsToCompleteGoal;
+
+	uint32_t volatile EntryToRead;
+	uint32_t volatile EntryToWrite;
+	HANDLE Semaphore;
+
+	job_system_entry Entries[128];
+};
+
+static void
+JobSystemAddEntry(job_system_queue *JobSystem, job_system_callback *Callback, void *Data)
+{
+	uint32_t NewEntryToWrite = (JobSystem->EntryToWrite + 1) % ArrayCount(JobSystem->Entries);
+	Assert(NewEntryToWrite != JobSystem->EntryToRead);
+
+	job_system_entry *Entry = JobSystem->Entries + JobSystem->EntryToWrite;
+	Entry->Callback = Callback;
+	Entry->Data = Data;
+
+	++JobSystem->JobsToCompleteGoal;
+	_WriteBarrier();
+
+	JobSystem->EntryToWrite = NewEntryToWrite;
+	ReleaseSemaphore(JobSystem->Semaphore, 1, 0);
+}
+
+static bool
+DoNextJobQueueEntry(job_system_queue *JobSystem)
+{
+	bool Sleep = false;
+
+	uint32_t OriginalEntryToRead = JobSystem->EntryToRead;
+	uint32_t NewEntryToRead = (OriginalEntryToRead + 1) % ArrayCount(JobSystem->Entries);
+	if(JobSystem->EntryToRead != JobSystem->EntryToWrite)
+	{
+		uint32_t Index = InterlockedCompareExchange((LONG volatile *)&JobSystem->EntryToRead, NewEntryToRead, OriginalEntryToRead);
+
+		if(Index == OriginalEntryToRead)
+		{
+			job_system_entry *Entry = JobSystem->Entries + Index;
+			Entry->Callback(Entry->Data);
+			InterlockedIncrement((LONG volatile *)&JobSystem->JobsToCompleteCount);
+		}
+	}
+	else
+	{
+		Sleep = true;
+	}
+
+	return(Sleep);
+}
+
+static void
+JobSystemCompleteAllWork(job_system_queue *JobSystem)
+{
+	while(JobSystem->JobsToCompleteCount != JobSystem->JobsToCompleteGoal)
+	{
+		DoNextJobQueueEntry(JobSystem);
+	}
+
+	JobSystem->JobsToCompleteCount = 0;
+	JobSystem->JobsToCompleteGoal = 0;
+}
+
+DWORD WINAPI
+ThreadProc(LPVOID lpParameter)
+{
+	job_system_queue *JobSystem = (job_system_queue *)lpParameter;
+
+	while(1)
+	{
+		if(DoNextJobQueueEntry(JobSystem))
+		{
+			WaitForSingleObjectEx(JobSystem->Semaphore, INFINITE, false);
+		}
+	}
+
+	return(0);
+}
+
+static void
+InitializeJobSystem(job_system_queue *JobSystem, uint32_t ThreadCount)
+{
+	JobSystem->JobsToCompleteCount = 0;
+	JobSystem->JobsToCompleteGoal = 0;
+
+	JobSystem->EntryToRead = 0;
+	JobSystem->EntryToWrite = 0;
+	
+	uint32_t InitialValue = 0;
+	JobSystem->Semaphore = CreateSemaphoreEx(0, InitialValue, INT_MAX, 0, 0, SEMAPHORE_ALL_ACCESS);
+
+	for(uint32_t ThreadIndex = 0;
+		ThreadIndex < ThreadCount;
+		ThreadIndex++)
+	{
+		HANDLE ThreadHandle = CreateThread(0, 0, ThreadProc, JobSystem, 0, 0);
+		CloseHandle(ThreadHandle);
+	}
+}
+
 int main(void)
 {
+	job_system_queue JobSystem;
+	InitializeJobSystem(&JobSystem, 3);
+
 	glfwInit();
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
@@ -174,6 +311,7 @@ int main(void)
 	glfwSetInputMode(Window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
 	game_memory GameMemory = {};
+	GameMemory.JobSystemQueue = &JobSystem;
 	GameMemory.PermanentStorageSize = Megabytes(256);
 	GameMemory.TemporaryStorageSize = Gigabytes(3);
 	GameMemory.PermanentStorage = malloc(GameMemory.PermanentStorageSize + GameMemory.TemporaryStorageSize);
@@ -218,7 +356,7 @@ int main(void)
 			glfwSwapBuffers(Window);
 
 			double EndTime = glfwGetTime();
-			std::cout << "Frame time: " << EndTime - LastTime << std::endl;
+			// std::cout << "Frame time: " << EndTime - LastTime << '\n';
 			LastTime = EndTime;
 		}
 	}

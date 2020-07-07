@@ -72,7 +72,7 @@ union vec3
 
 	float E[3];
 
-	vec3() {}
+	vec3() {x = y = z = 0.0f;}
 	vec3(float X, float Y, float Z) { x = X; y = Y; z = Z; }
 	vec3(vec2 XY, float Z) { xy = XY; z = Z; }
 };
@@ -121,7 +121,7 @@ union vec4
 
 	float E[4];
 
-	vec4() {}
+	vec4() {x = y = z = w = 0.0f; }
 	vec4(float X, float Y, float Z, float W) { x = X; y = Y; z = Z; w = W; }
 	vec4(vec3 V, float W) { xyz = V; w = W; }
 };
@@ -1221,6 +1221,221 @@ operator*(mat4 A, vec4 B)
 	Result.z = A.a31 * B.x + A.a32 * B.y + A.a33 * B.z + A.a34 * B.w;
 	Result.w = A.a41 * B.x + A.a42 * B.y + A.a43 * B.z + A.a44 * B.w;
 
+	return(Result);
+}
+
+//
+// NOTE(georgy): AABB
+//
+
+struct aabb
+{
+	vec3 Min;
+	vec3 Max;
+};
+
+struct segment
+{
+	vec3 Start;
+	vec3 End;	
+};
+
+inline aabb
+AABBMinMax(vec3 Min, vec3 Max)
+{
+	aabb Result;
+	Result.Min = Min;
+	Result.Max = Max;
+
+	return(Result);
+}
+
+inline aabb
+Translate(aabb &AABB, vec3 V)
+{
+	aabb Result;
+
+	Result.Min = AABB.Min + V;
+	Result.Max = AABB.Max + V;
+
+	return(Result);
+}
+
+static bool
+Intersect(const aabb &A, const aabb &B)
+{
+	bool Result = !((A.Min.x >= B.Max.x) ||
+					(A.Max.x <= B.Min.x) ||
+				  	(A.Min.y >= B.Max.y) ||
+				  	(A.Max.y <= B.Min.y) ||
+				  	(A.Min.z >= B.Max.z) ||
+				  	(A.Max.z <= B.Min.z));
+
+	return(Result);
+}
+
+enum intersect_moving_aabbs_result
+{
+	DONT_INTERSECT,
+	INTERSECT_AT_START,
+	INTERSECT_MOVING
+};
+
+static intersect_moving_aabbs_result
+IntersectMovingAABBs(const aabb &A, const aabb &B, vec3 DeltaP, vec3 *Normal, float *t)
+{
+	intersect_moving_aabbs_result Result = INTERSECT_MOVING;
+
+	if(Intersect(A, B))
+	{
+		*t = 0.0f;
+		float MinIntersection = FLT_MAX;
+		vec3 IntersectionNormal = vec3(0.0f, 0.0f, 0.0f);
+
+		for(uint32_t Axis = 0; Axis < 3; Axis++)
+		{
+			if(A.Max.E[Axis] > B.Max.E[Axis])
+			{
+				float Intersection = B.Max.E[Axis] - A.Min.E[Axis];
+				Assert(Intersection > 0.0f);
+
+				if(Intersection < MinIntersection)
+				{
+					MinIntersection = Intersection;
+					IntersectionNormal = {};
+					IntersectionNormal.E[Axis] = 1.0f;
+				}
+			}
+			else
+			{
+				float Intersection = A.Max.E[Axis] - B.Min.E[Axis];
+				Assert(Intersection > 0.0f);
+
+				if(Intersection < MinIntersection)
+				{
+					MinIntersection = Intersection;
+					IntersectionNormal = {};
+					IntersectionNormal.E[Axis] = -1.0f;
+				}
+			}
+		}
+
+		Result = INTERSECT_AT_START;
+		*t = MinIntersection;
+		*Normal = IntersectionNormal;
+	}
+	else
+	{
+		float tFirst = 0.0f;
+		float tLast = 1.0f;
+
+		for(uint32_t Axis = 0; Axis < 3; Axis++)
+		{
+			if(DeltaP.E[Axis] < 0.0f)
+			{
+				if(A.Max.E[Axis] <= B.Min.E[Axis]) Result = DONT_INTERSECT;
+				if(B.Max.E[Axis] <= A.Min.E[Axis]) 
+				{
+					float Temp = (B.Max.E[Axis] - A.Min.E[Axis]) / DeltaP.E[Axis];
+					Assert(Temp >= 0.0f);
+					if(Temp >= tFirst)
+					{
+						tFirst = Temp;
+						*Normal = {};
+						Normal->E[Axis] = 1.0f;
+					}
+				}
+				if(A.Max.E[Axis] > B.Min.E[Axis]) tLast = Min(tLast, (B.Min.E[Axis] - A.Max.E[Axis]) / DeltaP.E[Axis]);
+			}
+			else if(DeltaP.E[Axis] > 0.0f)
+			{
+				if(A.Min.E[Axis] >= B.Max.E[Axis]) Result = DONT_INTERSECT;
+				if(A.Max.E[Axis] <= B.Min.E[Axis]) 
+				{
+					float Temp = (B.Min.E[Axis] - A.Max.E[Axis]) / DeltaP.E[Axis];
+					Assert(Temp >= 0.0f);
+					if(Temp >= tFirst)
+					{
+						tFirst = Temp;
+						*Normal = {};
+						Normal->E[Axis] = -1.0f;
+					}
+				}
+				if(A.Min.E[Axis] < B.Max.E[Axis]) tLast = Min(tLast, (B.Max.E[Axis] - A.Min.E[Axis]) / DeltaP.E[Axis]);
+			}
+			else
+			{
+				Assert(DeltaP.E[Axis] == 0.0f);
+				
+				bool Intersect = ((A.Max.E[Axis] > B.Max.E[Axis]) && (A.Min.E[Axis] < B.Max.E[Axis])) || 
+								 ((B.Max.E[Axis] > A.Max.E[Axis]) && (B.Min.E[Axis] < A.Max.E[Axis]));
+
+				if(!Intersect)
+				{
+					Result = DONT_INTERSECT;
+				}
+			}
+
+			if(tFirst > tLast)
+			{
+				Result = DONT_INTERSECT;
+				break;
+			}
+		}
+
+		if(Result) 
+		{
+			*t = tFirst;
+		}
+	}
+
+	return(Result);
+}
+
+static bool
+IntersectSegmentAABB(const segment &Segment, const aabb &AABB, float *t)
+{
+	bool Result = true;
+
+	float tMin = 0.0f;
+	float tMax = Length(Segment.End - Segment.Start);
+	vec3 SegmentDir = NOZ(Segment.End - Segment.Start);
+
+	for(uint32_t Axis = 0; Axis < 3; Axis++)
+	{
+		if(Absolute(SegmentDir.E[Axis]) < Epsilon)
+		{
+			if((Segment.Start.E[Axis] < AABB.Min.E[Axis]) || (Segment.Start.E[Axis] > AABB.Max.E[Axis]))
+			{
+				Result = false;
+				break;
+			}
+		}
+		else
+		{
+			float Denom = 1.0f / SegmentDir.E[Axis];
+			float t1 = (AABB.Min.E[Axis] - Segment.Start.E[Axis]) * Denom;
+			float t2 = (AABB.Max.E[Axis] - Segment.Start.E[Axis]) * Denom;
+			
+			if(t1 > t2)
+			{
+				float Temp = t1;
+				t1 = t2;
+				t2 = Temp;
+			}
+
+			if(t1 > tMin) tMin = t1;
+			if(t2 < tMax) tMax = t2;
+
+			if(tMin > tMax)
+			{
+				Result = false;
+				break;
+			}
+		}
+	}
+
+	*t = tMin;
 	return(Result);
 }
 

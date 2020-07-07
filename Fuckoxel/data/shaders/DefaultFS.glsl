@@ -41,6 +41,7 @@ void main()
     FinalX = min(FinalX, 0.94);
 
     vec3 FinalColor = (1.0 - FinalX)*Input.Occlusion*Input.LightIntensity*Input.Color;
+    // vec3 FinalColor = (1.0 - FinalX)*Input.Occlusion*Input.Color;
     FinalColor = ApplyFog(FinalColor, length(Input.FragWorldP), normalize(Input.FragWorldP), -normalize(vec3(-0.5, -0.5, -0.5)));
 
     FragColor = vec4(FinalColor, 1.0);
