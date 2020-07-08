@@ -468,7 +468,7 @@ struct world
     chunk *ChunksToSetup[8];
 
     uint32_t ChunksToLoadCount;
-    chunk *ChunksToLoad[8];
+    chunk *ChunksToLoad[4];
 
     // TODO(georgy): Assert that 2048 is enough! (Make this dynamic array?)
     uint32_t ChunksToRenderCount;
@@ -502,12 +502,13 @@ struct hero
     vec3 dP;
     vec3 ddP;
 
+    aabb AABB;
+
     bool CanJump;
 };
 
 struct game_state
 {
-    bool Gravity;
     bool IsInitialized;
 
     camera Camera;
@@ -2298,7 +2299,6 @@ BeginSimulation(world *World, world_position *Origin, vec2 Bounds, stack_allocat
     }
 }
 
-
 static void
 GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth, uint32_t BufferHeight)
 {
@@ -2306,7 +2306,6 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
     game_state *GameState = (game_state *)Memory->PermanentStorage;
     if(!GameState->IsInitialized)
     {
-        GameState->Gravity = true;
         GameState->DefaultShader = shader("shaders\\DefaultVS.glsl", "shaders\\DefaultFS.glsl");
         GameState->ScreenShader = shader("shaders\\ScreenVS.glsl", "shaders\\ScreenFS.glsl");
 
@@ -2330,11 +2329,12 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        GameState->Camera = {};
-        GameState->Camera.P = vec3(0.0f, 0.5f, 0.0f);
-
         GameState->Hero = {};
-        GameState->Hero.WorldP.Offset.y = 70.0f;
+        GameState->Hero.WorldP.Offset.y = 90.0f;
+        GameState->Hero.AABB = AABBMinMax(vec3(-0.5f, -0.5f, -0.5f), vec3(0.5f, 0.5f, 0.5f));
+
+        GameState->Camera = {};
+        GameState->Camera.P = vec3(0.0f, GetHalfDim(GameState->Hero.AABB).y, 0.0f);
 
         GameState->IsInitialized = true;
     }
@@ -2432,16 +2432,12 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
     vec3 Drag = -2.0f*Hero->dP;
     Drag.y = 0.0f;
     Hero->ddP += Drag;
-    if(GameState->Gravity)
-	{
-		Hero->ddP.y += -9.8f;
-	}
+    Hero->ddP.y += -9.8f;
 
     Hero->dP += Input->dt*Hero->ddP;
     vec3 HeroDeltaP = Input->dt*Hero->dP;
 
-    aabb HeroAABB = AABBMinMax(vec3(-0.5f, -0.5f, -0.5f), vec3(0.5f, 0.5f, 0.5f));
-
+	aabb HeroAABB = Hero->AABB;
     aabb SweptAABB = {};
     {
         vec3 Min, Max;
@@ -2455,21 +2451,48 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         SweptAABB = AABBMinMax(Min, Max);
     }
 
-    uint32_t ChunksInBroadPhaseCount = 0;
-    chunk *ChunksInBroadPhase[8];
-    for(uint32_t ChunkIndex = 0;
-        ChunkIndex < World->ChunksToRenderCount;
-        ChunkIndex++)
+    struct chunk_broad_phase
     {
-        chunk *Chunk = World->ChunksToRender[ChunkIndex];
-        
-        aabb ChunkAABB = AABBMinMax(Chunk->SimP,
-                                    Chunk->SimP + World->ChunkDimInMeters);
-
-        if(Intersect(SweptAABB, ChunkAABB))
+        chunk *Chunk;
+        uint32_t MinXBlock, MinYBlock, MinZBlock;
+        uint32_t MaxXBlock, MaxYBlock, MaxZBlock;
+    };
+    uint32_t ChunksInBroadPhaseCount = 0;
+    chunk_broad_phase ChunksInBroadPhase[8];
+    for(int32_t ZOffset = -1; ZOffset <= 1; ZOffset++)
+    {
+        for(int32_t XOffset = -1; XOffset <= 1; XOffset++)
         {
-            Assert(ChunksInBroadPhaseCount < (ArrayCount(ChunksInBroadPhase)));
-            ChunksInBroadPhase[ChunksInBroadPhaseCount++] = Chunk;
+            chunk *Chunk = GetChunk(World, Hero->WorldP.ChunkX + XOffset, Hero->WorldP.ChunkZ + ZOffset);
+            if(Chunk && CheckFlag(Chunk, CHUNK_LOADED))
+            {   
+                aabb ChunkAABB = AABBMinMax(Chunk->SimP,
+                                            Chunk->SimP + World->ChunkDimInMeters);
+
+                if(Intersect(SweptAABB, ChunkAABB))
+                {
+                    Assert(ChunksInBroadPhaseCount < (ArrayCount(ChunksInBroadPhase)));
+
+                    vec3 MinOffset = SweptAABB.Min - ChunkAABB.Min;
+                    MinOffset = Clamp(MinOffset, 0.0f, FLT_MAX);
+                    MinOffset *= 1.0f / World->BlockDimInMeters;
+
+                    vec3 MaxOffset = SweptAABB.Max - ChunkAABB.Min;
+                    MaxOffset = Clamp(MaxOffset, vec3(0.0f, 0.0f, 0.0f), World->ChunkDimInMeters);
+                    MaxOffset *= 1.0f / World->BlockDimInMeters;
+                    MaxOffset = Clamp(MaxOffset, vec3(0.0f, 0.0f, 0.0f), vec3i(CHUNK_DIM_X - 1, CHUNK_DIM_Y - 1, CHUNK_DIM_Z - 1));
+
+                    chunk_broad_phase ChunkBroadPhase;
+                    ChunkBroadPhase.Chunk = Chunk;
+                    ChunkBroadPhase.MinXBlock = (uint32_t)MinOffset.x;
+                    ChunkBroadPhase.MinYBlock = (uint32_t)MinOffset.y;
+                    ChunkBroadPhase.MinZBlock = (uint32_t)MinOffset.z;
+                    ChunkBroadPhase.MaxXBlock = (uint32_t)MaxOffset.x;
+                    ChunkBroadPhase.MaxYBlock = (uint32_t)MaxOffset.y;
+                    ChunkBroadPhase.MaxZBlock = (uint32_t)MaxOffset.z;
+                    ChunksInBroadPhase[ChunksInBroadPhaseCount++] = ChunkBroadPhase;
+                }
+            }
         }
     }
 
@@ -2479,13 +2502,20 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         ChunkIndex < ChunksInBroadPhaseCount;
         ChunkIndex++)
     {
-        chunk *Chunk = ChunksInBroadPhase[ChunkIndex];
+        chunk_broad_phase ChunkBroadPhase = ChunksInBroadPhase[ChunkIndex];
+        chunk *Chunk = ChunkBroadPhase.Chunk;
+        uint32_t MinXBlock = ChunkBroadPhase.MinXBlock;
+        uint32_t MinYBlock = ChunkBroadPhase.MinYBlock;
+        uint32_t MinZBlock = ChunkBroadPhase.MinZBlock;
+        uint32_t MaxXBlock = ChunkBroadPhase.MaxXBlock;
+        uint32_t MaxYBlock = ChunkBroadPhase.MaxYBlock;
+        uint32_t MaxZBlock = ChunkBroadPhase.MaxZBlock;
 
-        for(uint32_t ZBlock = 0; ZBlock < CHUNK_DIM_Z; ZBlock++)
+        for(uint32_t ZBlock = MinZBlock; ZBlock <= MaxZBlock; ZBlock++)
         {
-            for(uint32_t XBlock = 0; XBlock < CHUNK_DIM_X; XBlock++)
+            for(uint32_t XBlock = MinXBlock; XBlock <= MaxXBlock; XBlock++)
             {
-                for(uint32_t YBlock = 0; YBlock < CHUNK_DIM_Y; YBlock++)
+                for(uint32_t YBlock = MinYBlock; YBlock <= MaxYBlock; YBlock++)
                 {
                     if(IsBlockSolid(Chunk->BlocksInfo->Blocks, XBlock, YBlock, ZBlock))
                     {
@@ -2563,13 +2593,14 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         }
     }
 
+    vec3 HalfDim = GetHalfDim(Hero->AABB);
     segment Segments[] = 
     {
-        {Hero->P, Hero->P + vec3(0.0f, -0.6f, 0.0f)},
-        {Hero->P + vec3(-0.5f, 0.0f, -0.5f), Hero->P + vec3(-0.5f, 0.0f, -0.5f) + vec3(0.0f, -0.6f, 0.0f)},
-        {Hero->P + vec3(-0.5f, 0.0f, 0.5f), Hero->P + vec3(-0.5f, 0.0f, 0.5f) + vec3(0.0f, -0.6f, 0.0f)},
-        {Hero->P + vec3(0.5f, 0.0f, 0.5f), Hero->P + vec3(0.5f, 0.0f, 0.5f) + vec3(0.0f, -0.6f, 0.0f)},
-        {Hero->P + vec3(0.5f, 0.0f, -0.5f), Hero->P + vec3(0.5f, 0.0f, -0.5f) + vec3(0.0f, -0.6f, 0.0f)},
+        {Hero->P, Hero->P + vec3(0.0f, -HalfDim.y - 0.1f, 0.0f)},
+        {Hero->P + vec3(-HalfDim.x, 0.0f, -HalfDim.z), Hero->P + vec3(-HalfDim.x, 0.0f, -HalfDim.z) + vec3(0.0f, -HalfDim.y - 0.1f, 0.0f)},
+        {Hero->P + vec3(-HalfDim.x, 0.0f, HalfDim.z), Hero->P + vec3(-HalfDim.x, 0.0f, HalfDim.z) + vec3(0.0f, -HalfDim.y - 0.1f, 0.0f)},
+        {Hero->P + vec3(HalfDim.x, 0.0f, HalfDim.z), Hero->P + vec3(HalfDim.x, 0.0f, HalfDim.z) + vec3(0.0f, -HalfDim.y - 0.1f, 0.0f)},
+        {Hero->P + vec3(HalfDim.x, 0.0f, -HalfDim.z), Hero->P + vec3(HalfDim.x, 0.0f, -HalfDim.z) + vec3(0.0f, -HalfDim.y - 0.1f, 0.0f)},
     };
     bool Intersect = false;
     for(uint32_t SegmentIndex = 0; 
@@ -2599,64 +2630,59 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         int32_t BlockX = (int32_t)(NewHeroWorldP.Offset.x / World->BlockDimInMeters);
         int32_t BlockY = (int32_t)(NewHeroWorldP.Offset.y / World->BlockDimInMeters);
         int32_t BlockZ = (int32_t)(NewHeroWorldP.Offset.z / World->BlockDimInMeters);
-        std::cout << "Chunk: (" << Chunk->X << ", " << Chunk->Z << ") Block: (" << BlockX << ", " << BlockY << ", " << BlockZ << ")\n";
 
         chunk *LastChunk = Chunk;
         int32_t LastFreeBlockX = BlockX;
         int32_t LastFreeBlockY = BlockY;
         int32_t LastFreeBlockZ = BlockZ;
 
-#if 1
         vec3 RayP = Hero->P + Camera->P;
         vec3 RayDir = Camera->ViewDir;
         for(uint32_t BlockIndex = 0; BlockIndex < 10; BlockIndex++)
         {
             float XBorderDist = FLT_MAX;
-            if(RayDir.x > 0.0f)
             {
-                float PlaneD = Chunk->SimP.x + (BlockX + 1)*World->BlockDimInMeters;
                 vec3 PlaneN = vec3(1.0f, 0.0f, 0.0f);
-
-                XBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
-            }
-            else if(RayDir.x < 0.0f)
-            {
-                float PlaneD = Chunk->SimP.x + BlockX*World->BlockDimInMeters;
-                vec3 PlaneN = vec3(1.0f, 0.0f, 0.0f);
-
-                XBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                if(RayDir.x > 0.0f)
+                {
+                    float PlaneD = Chunk->SimP.x + (BlockX + 1)*World->BlockDimInMeters;
+                    XBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                }
+                else if(RayDir.x < 0.0f)
+                {
+                    float PlaneD = Chunk->SimP.x + BlockX*World->BlockDimInMeters;
+                    XBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                }
             }
 
             float YBorderDist = FLT_MAX;
-            if(RayDir.y > 0.0f)
             {
-                float PlaneD = Chunk->SimP.y + (BlockY + 1)*World->BlockDimInMeters;
                 vec3 PlaneN = vec3(0.0f, 1.0f, 0.0f);
-
-                YBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
-            }
-            else if(RayDir.y < 0.0f)
-            {
-                float PlaneD = Chunk->SimP.y + BlockY*World->BlockDimInMeters;
-                vec3 PlaneN = vec3(0.0f, 1.0f, 0.0f);
-
-                YBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                if(RayDir.y > 0.0f)
+                {
+                    float PlaneD = Chunk->SimP.y + (BlockY + 1)*World->BlockDimInMeters;
+                    YBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                }
+                else if(RayDir.y < 0.0f)
+                {
+                    float PlaneD = Chunk->SimP.y + BlockY*World->BlockDimInMeters;
+                    YBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                }
             }
             
             float ZBorderDist = FLT_MAX;
-            if(RayDir.z > 0.0f)
             {
-                float PlaneD = Chunk->SimP.z + (BlockZ + 1)*World->BlockDimInMeters;
                 vec3 PlaneN = vec3(0.0f, 0.0f, 1.0f);
-
-                ZBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
-            }
-            else if(RayDir.z < 0.0f)
-            {
-                float PlaneD = Chunk->SimP.z + BlockZ*World->BlockDimInMeters;
-                vec3 PlaneN = vec3(0.0f, 0.0f, 1.0f);
-
-                ZBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                if(RayDir.z > 0.0f)
+                {
+                    float PlaneD = Chunk->SimP.z + (BlockZ + 1)*World->BlockDimInMeters;
+                    ZBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                }
+                else if(RayDir.z < 0.0f)
+                {
+                    float PlaneD = Chunk->SimP.z + BlockZ*World->BlockDimInMeters;
+                    ZBorderDist = (PlaneD - Dot(RayP, PlaneN)) / Dot(RayDir, PlaneN);
+                }
             }
 
             if(XBorderDist <= YBorderDist)
@@ -2689,7 +2715,6 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
                 }
             }
 
-            std::cout << "Chunk: (" << Chunk->X << ", " << Chunk->Z << ") Block: (" << BlockX << ", " << BlockY << ", " << BlockZ << ")\n";
             if(IsBlockSolid(Chunk->BlocksInfo->Blocks, BlockX, BlockY, BlockZ))
             {
                 BlockType(LastChunk->BlocksInfo->Blocks, LastFreeBlockX, LastFreeBlockY, LastFreeBlockZ) = block_type::BLOCK_SOIL;
@@ -2706,7 +2731,6 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
                 LastFreeBlockZ = BlockZ;
             }
         }
-#endif
     }
 
     Hero->WorldP = MapIntoChunkSpace(World, &Hero->WorldP, Hero->P);

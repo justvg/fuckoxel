@@ -289,13 +289,6 @@ Lerp(float A, float B, float t)
 inline float
 Clamp(float Value, float Min, float Max)
 {
-	if(Min > Max)
-	{
-		float Temp = Min;
-		Min = Max;
-		Max = Temp;
-	}
-
 	if(Value < Min) Value = Min;
 	else if(Value > Max) Value = Max;
 
@@ -638,6 +631,30 @@ inline vec3
 Lerp(vec3 A, vec3 B, float t)
 {
 	vec3 Result = A + (B - A) * t;
+
+	return(Result);
+}
+
+inline vec3
+Clamp(vec3 V, float Min, float Max)
+{
+	vec3 Result;
+
+	Result.x = Clamp(V.x, Min, Max);
+	Result.y = Clamp(V.y, Min, Max);
+	Result.z = Clamp(V.z, Min, Max);
+
+	return(Result);
+}
+
+inline vec3
+Clamp(vec3 V, vec3 Min, vec3 Max)
+{
+	vec3 Result;
+
+	Result.x = Clamp(V.x, Min.x, Max.x);
+	Result.y = Clamp(V.y, Min.y, Max.y);
+	Result.z = Clamp(V.z, Min.z, Max.z);
 
 	return(Result);
 }
@@ -1248,6 +1265,14 @@ AABBMinMax(vec3 Min, vec3 Max)
 	Result.Max = Max;
 
 	return(Result);
+}
+
+inline vec3
+GetHalfDim(const aabb &AABB)
+{
+	vec3 HalfDim = 0.5f*(AABB.Max - AABB.Min);
+	
+	return(HalfDim);
 }
 
 inline aabb
