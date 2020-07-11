@@ -29,8 +29,10 @@ struct game_input
 			button MoveRight;
 			button MoveLeft;
 			button MoveUp;;
+
+			button H;
 		};
-		button Buttons[5];
+		button Buttons[6];
 	};
 };
 
@@ -133,6 +135,19 @@ GLFWKeyCallback(GLFWwindow *Window, int Key, int ScanCode, int Action, int Mods)
 		{
 			Input->MoveUp.EndedDown = false;
 			++Input->MoveUp.HalfTransitionCount;
+		}
+	}
+	if(Key == GLFW_KEY_H)
+	{
+		if(Action == GLFW_PRESS)
+		{
+			Input->H.EndedDown = true;
+			++Input->H.HalfTransitionCount;
+		}
+		else if(Action == GLFW_RELEASE)
+		{
+			Input->H.EndedDown = false;
+			++Input->H.HalfTransitionCount;
 		}
 	}
 }

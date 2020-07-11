@@ -507,6 +507,73 @@ struct hero
     bool CanJump;
 };
 
+struct entity_path_graph_entry
+{
+    bool Visited;
+    entity_path_graph_entry *Parent;
+    uint32_t BlockX, BlockY, BlockZ;
+};
+
+static entity_path_graph_entry *
+GetNodeFromPathGraph(entity_path_graph_entry *Graph, uint32_t Count, int32_t X, int32_t Z)
+{
+    entity_path_graph_entry *Result = 0;
+
+    if((X >= 0) && (X < CHUNK_DIM_X) &&
+        (Z >= 0) && (Z < CHUNK_DIM_Z))
+    {
+        for(uint32_t NodeIndex = 0; 
+            NodeIndex < Count; 
+            NodeIndex++)
+        {
+            entity_path_graph_entry *Node = Graph + NodeIndex;
+
+            if((Node->BlockX == X) &&
+            (Node->BlockZ == Z))
+            {
+                Result = Node;
+                break;
+            }
+        }
+    }
+
+    return(Result);
+}
+
+struct path_graph_entries_queue
+{
+    uint32_t Head, Tail;
+    entity_path_graph_entry *Entries[256];
+};
+
+static bool
+IsEmpty(path_graph_entries_queue *Queue)
+{
+    bool Result = (Queue->Head == Queue->Tail);
+    return(Result);
+}
+
+static void
+Enqueue(path_graph_entries_queue *Queue, entity_path_graph_entry *Entry)
+{
+    uint32_t NewTail = (Queue->Tail + 1) % ArrayCount(Queue->Entries);
+    Assert(NewTail != Queue->Head);
+
+    Queue->Entries[Queue->Tail] = Entry;
+    Queue->Tail = NewTail;
+}
+
+static entity_path_graph_entry *
+Dequeue(path_graph_entries_queue *Queue)
+{
+    Assert(!IsEmpty(Queue));
+
+    entity_path_graph_entry *Result = Queue->Entries[Queue->Head];
+    Queue->Head = (Queue->Head + 1) % ArrayCount(Queue->Entries);
+
+    return(Result);
+}
+
 struct game_state
 {
     bool IsInitialized;
@@ -519,6 +586,21 @@ struct game_state
 
     GLuint CrossHairTexture;
     GLuint QuadVAO, QuadVBO;
+
+
+    // NOTE(georgy): Test entity path finding stuff
+    uint32_t RabbitCurrentPathCount;
+    entity_path_graph_entry *RabbitCurrentPath[128];
+    uint32_t RabbitGraphNodesCount;
+    entity_path_graph_entry RabbitGraph[1024];
+    bool RabbitSpawned;
+    bool RabbitHasCurrentTargetBlock;
+    uint32_t RabbitCurrentBlockX;
+    uint32_t RabbitCurrentBlockY;
+    uint32_t RabbitCurrentBlockZ;
+    world_position RabbitWorldP;
+    vec3 RabbitdP;
+    GLuint CubeVAO, CubeVBO;
 };
 
 struct temp_state
@@ -532,7 +614,6 @@ struct temp_state
 
     stack_allocator TempAllocator;
 };
-
 
 inline void
 ResetWorldWork(world *World)
@@ -2329,6 +2410,62 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
+        
+        float CubeVertices[] = {
+            // Back face
+            -0.5f, -0.5f, -0.5f,
+            0.5f,  0.5f, -0.5f,
+            0.5f, -0.5f, -0.5f,
+            0.5f,  0.5f, -0.5f,
+            -0.5f, -0.5f, -0.5f,
+            -0.5f,  0.5f, -0.5f,
+            // Front face
+            -0.5f, -0.5f,  0.5f,
+            0.5f, -0.5f,  0.5f,
+            0.5f,  0.5f,  0.5f,
+            0.5f,  0.5f,  0.5f,
+            -0.5f,  0.5f,  0.5f,
+            -0.5f, -0.5f,  0.5f,
+            // Left face
+            -0.5f,  0.5f,  0.5f,
+            -0.5f,  0.5f, -0.5f,
+            -0.5f, -0.5f, -0.5f,
+            -0.5f, -0.5f, -0.5f,
+            -0.5f, -0.5f,  0.5f,
+            -0.5f,  0.5f,  0.5f,
+            // Right face
+            0.5f,  0.5f,  0.5f,
+            0.5f, -0.5f, -0.5f,
+            0.5f,  0.5f, -0.5f,
+            0.5f, -0.5f, -0.5f,
+            0.5f,  0.5f,  0.5f,
+            0.5f, -0.5f,  0.5f,
+            // Bottom face
+            -0.5f, -0.5f, -0.5f,
+            0.5f, -0.5f, -0.5f,
+            0.5f, -0.5f,  0.5f,
+            0.5f, -0.5f,  0.5f,
+            -0.5f, -0.5f,  0.5f,
+            -0.5f, -0.5f, -0.5f,
+            // Top face
+            -0.5f,  0.5f, -0.5f,
+            0.5f,  0.5f , 0.5f,
+            0.5f,  0.5f, -0.5f,
+            0.5f,  0.5f,  0.5f,
+            -0.5f,  0.5f, -0.5f,
+            -0.5f,  0.5f,  0.5f,
+	    };
+
+        glGenVertexArrays(1, &GameState->CubeVAO);
+        glGenBuffers(1, &GameState->CubeVBO);
+        glBindVertexArray(GameState->CubeVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, GameState->CubeVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(CubeVertices), CubeVertices, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3*sizeof(float), (void*)0);
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
         GameState->Hero = {};
         GameState->Hero.WorldP.Offset.y = 90.0f;
         GameState->Hero.AABB = AABBMinMax(vec3(-0.5f, -0.5f, -0.5f), vec3(0.5f, 0.5f, 0.5f));
@@ -2731,6 +2868,173 @@ GameUpdateAndRender(game_memory *Memory, game_input *Input, uint32_t BufferWidth
                 LastFreeBlockZ = BlockZ;
             }
         }
+    }
+    
+    // NOTE(georgy): Test entity path finding stuff
+    if(Input->H.EndedDown && !GameState->RabbitSpawned)
+    {
+        chunk *Chunk = GetChunk(World, 0, 0);
+
+        GameState->RabbitWorldP = {};
+        uint32_t BlockX = CHUNK_DIM_X / 2;
+		uint32_t BlockZ = CHUNK_DIM_Z / 2;
+		uint32_t BlockY = Chunk->HeightMap[BlockZ*CHUNK_DIM_X + BlockX] + 1;
+        GameState->RabbitWorldP.Offset = World->BlockDimInMeters*vec3i(BlockX, BlockY, BlockZ) + 
+                                         0.5f*vec3(World->BlockDimInMeters, World->BlockDimInMeters, World->BlockDimInMeters);
+
+        GameState->RabbitCurrentBlockX = BlockX;
+        GameState->RabbitCurrentBlockY = BlockY;
+        GameState->RabbitCurrentBlockZ = BlockZ;
+
+        GameState->RabbitGraphNodesCount = 0;
+        for(uint32_t Z = 0; Z < CHUNK_DIM_Z; Z++)
+        {
+            for(uint32_t X = 0; X < CHUNK_DIM_X; X++)
+            {
+                uint32_t Y = Chunk->HeightMap[Z*CHUNK_DIM_X + X] + 1;
+
+                GameState->RabbitGraph[GameState->RabbitGraphNodesCount].Visited = false;
+                GameState->RabbitGraph[GameState->RabbitGraphNodesCount].BlockX = X;
+                GameState->RabbitGraph[GameState->RabbitGraphNodesCount].BlockY = Y;
+                GameState->RabbitGraph[GameState->RabbitGraphNodesCount].BlockZ = Z;
+
+                ++GameState->RabbitGraphNodesCount;
+            }
+        }
+
+        GameState->RabbitSpawned = true;
+    }
+
+    if(GameState->RabbitSpawned)
+    {
+        vec3 ddP = vec3(0.0f, 0.0f, 0.0f);
+        if(!GameState->RabbitHasCurrentTargetBlock)
+        {
+            entity_path_graph_entry *StartNode;
+            for(uint32_t NodeIndex = 0; NodeIndex < GameState->RabbitGraphNodesCount; NodeIndex++)
+            {
+                entity_path_graph_entry *Node = GameState->RabbitGraph + NodeIndex;
+
+                Node->Visited = false;
+                Node->Parent = 0;
+
+                if((Node->BlockX == GameState->RabbitCurrentBlockX) &&
+                   (Node->BlockY == GameState->RabbitCurrentBlockY) &&
+                   (Node->BlockZ == GameState->RabbitCurrentBlockZ))
+                {
+                    StartNode = Node;
+                    StartNode->Visited = true;
+                }
+            }
+
+            path_graph_entries_queue Queue = {};
+            Enqueue(&Queue, StartNode);
+            while(!IsEmpty(&Queue))
+            {
+                entity_path_graph_entry *Node = Dequeue(&Queue);
+
+                int32_t X = (int32_t)Node->BlockX - 1;
+                int32_t Z = Node->BlockZ;
+                entity_path_graph_entry *LeftNeighbour = GetNodeFromPathGraph(GameState->RabbitGraph, GameState->RabbitGraphNodesCount, X, Z);
+                if(LeftNeighbour && (((int32_t)LeftNeighbour->BlockY - (int32_t)Node->BlockY) < 2) && !LeftNeighbour->Visited)
+                {
+                    LeftNeighbour->Visited = true;
+                    LeftNeighbour->Parent = Node;
+                    Enqueue(&Queue, LeftNeighbour);
+                }
+
+
+                X = Node->BlockX + 1;
+                Z = Node->BlockZ;
+                entity_path_graph_entry *RightNeighbour = GetNodeFromPathGraph(GameState->RabbitGraph, GameState->RabbitGraphNodesCount, X, Z);
+                if(RightNeighbour && (((int32_t)RightNeighbour->BlockY - (int32_t)Node->BlockY) < 2) && !RightNeighbour->Visited)
+                {
+                    RightNeighbour->Visited = true;
+                    RightNeighbour->Parent = Node;
+                    Enqueue(&Queue, RightNeighbour);
+                }
+
+
+                X = Node->BlockX;
+                Z = (int32_t)Node->BlockZ - 1;
+                entity_path_graph_entry *TopNeighbour = GetNodeFromPathGraph(GameState->RabbitGraph, GameState->RabbitGraphNodesCount, X, Z);
+                if(TopNeighbour && (((int32_t)TopNeighbour->BlockY - (int32_t)Node->BlockY) < 2) && !TopNeighbour->Visited)
+                {
+                    TopNeighbour->Visited = true;
+                    TopNeighbour->Parent = Node;
+                    Enqueue(&Queue, TopNeighbour);
+                }
+
+                X = Node->BlockX;
+                Z = Node->BlockZ + 1;
+                entity_path_graph_entry *BotNeighbour = GetNodeFromPathGraph(GameState->RabbitGraph, GameState->RabbitGraphNodesCount, X, Z);
+                if(BotNeighbour && (((int32_t)BotNeighbour->BlockY - (int32_t)Node->BlockY) < 2) && !BotNeighbour->Visited)
+                {
+                    BotNeighbour->Visited = true;
+                    BotNeighbour->Parent = Node;
+                    Enqueue(&Queue, BotNeighbour);
+                }
+            }
+            
+            uint32_t TargetBlockX = rand() % CHUNK_DIM_X;
+            uint32_t TargetBlockZ = rand() % CHUNK_DIM_Z;
+            while((TargetBlockX == GameState->RabbitCurrentBlockX) &&
+                  (TargetBlockZ == GameState->RabbitCurrentBlockZ))
+            {
+                TargetBlockX = rand() % CHUNK_DIM_X;
+                TargetBlockZ = rand() % CHUNK_DIM_Z;
+            }
+
+            entity_path_graph_entry *TargetNode = GetNodeFromPathGraph(GameState->RabbitGraph, GameState->RabbitGraphNodesCount, 
+                                                                       TargetBlockX, TargetBlockZ);
+            Assert(TargetNode);
+
+            GameState->RabbitCurrentPathCount = 0;
+            entity_path_graph_entry *Node = TargetNode;
+            while(Node)
+            {
+                GameState->RabbitCurrentPath[GameState->RabbitCurrentPathCount++] = Node;
+                Node = Node->Parent;
+            }
+            Assert(GameState->RabbitCurrentPath[GameState->RabbitCurrentPathCount - 1] == StartNode);
+
+            GameState->RabbitHasCurrentTargetBlock = true;
+        }
+        else
+        {
+            entity_path_graph_entry *TargetBlock = GameState->RabbitCurrentPath[GameState->RabbitCurrentPathCount - 2];
+
+            vec3 TargetP = World->BlockDimInMeters*vec3i(TargetBlock->BlockX, TargetBlock->BlockY, TargetBlock->BlockZ) + 
+                           0.5f*vec3(World->BlockDimInMeters, World->BlockDimInMeters, World->BlockDimInMeters);
+            vec3 MovingDir = TargetP - GameState->RabbitWorldP.Offset;
+
+            ddP = 5.0f*NOZ(MovingDir);
+        }
+        ddP -= 2.0f*GameState->RabbitdP;
+
+        GameState->RabbitdP += Input->dt*ddP;
+        GameState->RabbitWorldP.Offset += Input->dt*GameState->RabbitdP;
+
+        GameState->RabbitCurrentBlockX = (uint32_t)(GameState->RabbitWorldP.Offset.x / World->BlockDimInMeters);
+        GameState->RabbitCurrentBlockY = (uint32_t)(GameState->RabbitWorldP.Offset.y / World->BlockDimInMeters);
+        GameState->RabbitCurrentBlockZ = (uint32_t)(GameState->RabbitWorldP.Offset.z / World->BlockDimInMeters);
+        if((GameState->RabbitCurrentBlockX == GameState->RabbitCurrentPath[GameState->RabbitCurrentPathCount - 2]->BlockX) &&
+           (GameState->RabbitCurrentBlockY == GameState->RabbitCurrentPath[GameState->RabbitCurrentPathCount - 2]->BlockY) &&
+           (GameState->RabbitCurrentBlockZ == GameState->RabbitCurrentPath[GameState->RabbitCurrentPathCount - 2]->BlockZ))
+        {
+            --GameState->RabbitCurrentPathCount;
+            if(GameState->RabbitCurrentPathCount == 1)
+            {
+                GameState->RabbitHasCurrentTargetBlock = false;
+            }
+        }
+
+        vec3 RabbitSimP = Substract(World, &GameState->RabbitWorldP, &Hero->WorldP);
+        mat4 CubeModel = Translation(RabbitSimP) * Scaling(0.25f);
+        GameState->DefaultShader.SetMat4("Model", CubeModel);
+        glBindVertexArray(GameState->CubeVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glBindVertexArray(0);
     }
 
     Hero->WorldP = MapIntoChunkSpace(World, &Hero->WorldP, Hero->P);
